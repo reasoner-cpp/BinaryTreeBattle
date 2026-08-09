@@ -14,6 +14,11 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+// 目标 Windows 版本: Vista+ (需要 GetTickCount64 / SetProcessDPIAware 等)
+// 在包含 windows.h 之前定义; MSVC 默认已满足, MinGW 需要显式指定
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>   // 必须先于 windows.h (联机对战)
 #include <ws2tcpip.h>
