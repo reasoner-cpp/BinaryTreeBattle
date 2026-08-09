@@ -4,17 +4,18 @@ A turn-based tree-building tactics game for Windows. Grow a binary tree from you
 
 ## Game modes
 
-- **PvP** — local 2 / 4 players, or online via a room server
+- **PvP** — local 2 / 4 players, or online (2 / 4 players) via a room server
 - **vs AI** — Easy / Normal / Hard
 - **AI Battle** — built-in AI vs AI, or with plugins
 - **Replay** — play back saved games (`.btb`)
-- **Settings** — map size, game rules, hotkeys
+- **Settings** — map size, game rules, hotkeys, virtual network
 
 ## Highlights
 
 - Self-learning AI — Alpha-Beta search, forward simulation, learns from replays
 - AI plugin SDK — write your own AI, drop a DLL into `ai_plugins\`
-- Online PvP through a lightweight room relay server
+- Online PvP for 2 or 4 players (IPv4) through a room relay server
+- EasyTier / ZeroTier / Tailscale virtual-network support (`btbserver` + one-click launch)
 - Replay system with full action timeline and seek bar
 - Self-play evaluator (`selfplay2`)
 
@@ -40,7 +41,7 @@ Compile your DLL and copy it into `ai_plugins\`. Guide: `docs/AI_Plugin_Guide.md
 
 ## Docs
 
-- Game manual (Chinese): `docs/二叉树游戏说明v6.2.0.txt`
+- Game manual (Chinese): `docs/二叉树游戏说明v6.3.0.txt`
 - AI plugin guide: `docs/AI_Plugin_Guide.md`
 
 ## License

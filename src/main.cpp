@@ -303,7 +303,7 @@ public:
         if(!RegisterClassExW(&wc)) return false;
         RECT rc{0,0,FULL_W,WIN_H};
         AdjustWindowRectEx(&rc,WS_OVERLAPPEDWINDOW,FALSE,0);
-        m_hwnd=CreateWindowExW(0,L"BTreeBattle",L"Binary Tree Battle V6.2.0",
+        m_hwnd=CreateWindowExW(0,L"BTreeBattle",L"Binary Tree Battle V6.3.0",
             WS_OVERLAPPEDWINDOW|WS_VISIBLE,CW_USEDEFAULT,CW_USEDEFAULT,
             rc.right-rc.left,rc.bottom-rc.top,nullptr,nullptr,hInst,nullptr);
         if(!m_hwnd) return false;
@@ -1200,24 +1200,14 @@ private:
         if(m_netSock==INVALID_SOCKET) return;
         send(m_netSock, msg.c_str(), (int)msg.size(), 0);
     }
-    // 解析 host:port / [v6]:port → host/port
+    // 解析 host:port → host/port (IPv4 only)
     void parseHostPort(const std::string& hp, std::string& host, std::string& port){
         host=hp; port="8080";
-        if(!hp.empty() && hp.front()=='['){
-            size_t close=hp.find(']');
-            if(close!=std::string::npos){
-                host=hp.substr(1,close-1);
-                if(close+1<hp.size() && hp[close+1]==':') port=hp.substr(close+2);
-                if(host.empty()) host="::1";
-            }
-        }else{
-            int colons=0; for(char c:hp) if(c==':') colons++;
-            if(colons>1 && hp.rfind("::1:",0)==0){ host="::1"; port=hp.substr(4); }
-            else if(colons>1){ host=hp; }
-            else{
-                size_t colon=hp.rfind(':');
-                if(colon!=std::string::npos){ host=hp.substr(0,colon); port=hp.substr(colon+1); if(host.empty()) host="::1"; }
-            }
+        size_t colon=hp.rfind(':');
+        if(colon!=std::string::npos){
+            host=hp.substr(0,colon);
+            port=hp.substr(colon+1);
+            if(host.empty()) host="127.0.0.1";
         }
     }
     // 连接房间服务器 (出站, 无需开放入站端口)
@@ -1225,7 +1215,7 @@ private:
         std::string host, port;
         parseHostPort(serverAddr, host, port);
         addrinfo hints{}, *res=nullptr;
-        hints.ai_family=AF_UNSPEC; hints.ai_socktype=SOCK_STREAM;
+        hints.ai_family=AF_INET; hints.ai_socktype=SOCK_STREAM;
         int gai=getaddrinfo(host.c_str(), port.c_str(), &hints, &res);
         if(gai!=0){ m_netErrMsg="Cannot resolve server \""+host+"\""; return false; }
         SOCKET s=INVALID_SOCKET; int lastErr=0;
@@ -1254,15 +1244,19 @@ private:
         }
         u_long nm=1; ioctlsocket(s,FIONBIO,&nm);
         m_netSock=s; m_netBuf.clear();
-        m_netActive=false; m_netGotSeed=false; m_netOppLeft=false; m_netOppColor=-1;
+        m_netActive=false; m_netGotSeed=false; m_netOppLeft=false;
+        for(int i=0;i<4;++i) m_netPlayerColors[i]=-1;
+        m_netRoomFull=false; m_netJoined=1;
         return true;
     }
-    // 开房: 连服务器 → CREATE → 服务器返回 ROOM 房间码
+    // 开房: 连服务器 → CREATE <n> → 服务器返回 ROOM 房间码
     bool netHost(const std::string& serverAddr){
         if(!netConnectServer(serverAddr)) return false;
-        m_netRole=0; m_netColor=0; m_netWaiting=true;
+        m_netRole=0; m_netColor=0; m_netWaiting=true; m_netPlayerIdx=0;
         m_netServer="Connecting..."; m_netErrMsg.clear();
-        netSend("CREATE\n");
+        m_netPlayerColors[0]=m_netColor; m_netJoined=1;
+        char buf[32]; snprintf(buf,sizeof buf,"CREATE %d\n",m_netRoomSize);
+        netSend(buf);
         m_state=State::Playing;
         return true;
     }
@@ -1273,29 +1267,58 @@ private:
         if(sp!=std::string::npos){ server=serverAndRoom.substr(0,sp); room=serverAndRoom.substr(sp+1); }
         if(server.empty()||room.empty()){ m_netErrMsg="Enter: serverAddr roomCode  (e.g. host:8080 1234)"; return false; }
         if(!netConnectServer(server)) return false;
-        m_netRole=1; m_netColor=1; m_netWaiting=true;
+        m_netRole=1; m_netColor=1; m_netWaiting=true; m_netPlayerIdx=-1;
         m_netServer="Joined "+server+" room "+room; m_netErrMsg.clear();
+        m_netJoined=1; m_netPlayerColors[0]=-1;
         netSend("JOIN "+room+"\n");
         m_state=State::Playing;
         return true;
     }
     void netDisconnect(){
         if(m_netSock!=INVALID_SOCKET){ closesocket(m_netSock); m_netSock=INVALID_SOCKET; }
-        m_netActive=false; m_netWaiting=false; m_netMyTurn=false; m_netOppLeft=false; m_netOppColor=-1;
+        m_netActive=false; m_netWaiting=false; m_netMyTurn=false; m_netOppLeft=false; m_netRoomFull=false;
     }
     void netOppLeft(){ m_netOppLeft=true; netDisconnect(); }
-    // 在线开局: 本机色 m_netColor, 对方色 m_netOppColor, 主机先手并发送种子
+    // 房主: 当房间满员且各玩家颜色唯一时, 广播开局并本地开局
+    void hostTryStart(){
+        if(m_netRole!=0) return;
+        int need = m_netRoomSize;
+        if(need!=2 && need!=4) need=2;
+        // 房间是否满员 (房主自己 + 已加入位图)
+        bool full = (m_netJoined & ((1<<need)-1)) == ((1<<need)-1);
+        if(!full) return;
+        // 各玩家颜色是否唯一
+        bool seen[4]={false,false,false,false};
+        for(int j=0;j<need;++j){
+            int c=m_netPlayerColors[j];
+            if(c<0 || c>3 || seen[c]) return;
+            seen[c]=true;
+        }
+        // 发起开局
+        char mb[24]; snprintf(mb,sizeof mb,"MAPSIZE %d\n",m_settings.mapIdx); netSend(mb);
+        char cm[48]; snprintf(cm,sizeof cm,"COLORMAP %d %d %d %d\n",
+            m_netPlayerColors[0],m_netPlayerColors[1],m_netPlayerColors[2],m_netPlayerColors[3]);
+        netSend(cm);
+        netSend("START\n");
+        netStartPeer();
+    }
+    // 在线开局: 按玩家编号摆根 (颜色=角), 玩家0(房主)先手并发送黄点种子
     void netStartPeer(){
-        m_aiMode=false; m_bothAI=false; m_netActive=true; m_players=2;
-        m_netMyTurn = (m_netRole==0);   // 主机先手
+        m_aiMode=false; m_bothAI=false; m_netActive=true;
+        m_players = (m_netRoomSize==4)?4:2;
+        m_netMyTurn = (m_netPlayerIdx==0);   // 房主先手
         m_netWaiting=false;
         m_all.clear(); m_scores.clear(); m_history.clear();
         for(int i=0;i<4;++i) m_roots[i].reset();
-        int oc = (m_netOppColor>=0)?m_netOppColor:1-m_netColor;
-        m_roots[0]=std::make_unique<Node>(Node{{80,80},CLR_TEAMS[m_netColor]});
-        m_roots[1]=std::make_unique<Node>(Node{{WIN_W-80.f,WIN_H-80.f},CLR_TEAMS[oc]});
-        m_all.push_back(m_roots[0].get()); m_all.push_back(m_roots[1].get());
-        m_turn=CLR_TEAMS[m_netColor]; m_sel=m_hover=nullptr; m_extend=0; m_str=DEF_S;
+        int corners[4][2] = {{80,80},{WIN_W-80,WIN_H-80},{WIN_W-80,80},{80,WIN_H-80}};
+        for(int j=0;j<m_players;++j){
+            int c = m_netPlayerColors[j];
+            if(c<0 || c>3) c = j%4;
+            m_roots[c] = std::make_unique<Node>(Node{{(float)corners[c][0],(float)corners[c][1]}, CLR_TEAMS[c]});
+            m_all.push_back(m_roots[c].get());
+        }
+        m_turn=CLR_TEAMS[(m_netPlayerColors[0]>=0)?m_netPlayerColors[0]:m_netColor];
+        m_sel=m_hover=nullptr; m_extend=0; m_str=DEF_S;
         m_reinf=nullptr; m_reinfStr=0; m_nodeMenu=nullptr; m_didBranch=false; m_xUsedThisTurn=false;
         m_plyScores[0]=START_SCORE; m_plyScores[1]=START_SCORE; m_plyScores[2]=START_SCORE; m_plyScores[3]=START_SCORE;
         m_over=false; m_winner.clear();
@@ -1317,16 +1340,39 @@ private:
     }
     // 处理一行网络消息 (服务器转发, 带 "PEER " 前缀)
     void netHandleLine(const std::string& line){
+        bool fromPeer=false;
         std::string msg=line;
-        if(msg.rfind("PEER ",0)==0) msg=msg.substr(5);
+        if(msg.rfind("PEER ",0)==0){ fromPeer=true; msg=msg.substr(5); }
         if(msg.rfind("BYE",0)==0){ netOppLeft(); return; }
         if(msg.rfind("ROOM ",0)==0){ m_netServer="Room code: "+msg.substr(5); return; }   // 开房成功
-        if(msg.rfind("COLOR ",0)==0){
-            m_netOppColor=atoi(msg.c_str()+6);
-            if(m_netRole==0){
-                if(m_netOppColor==m_netColor) netSend("TAKECOLOR\n");
-                else { char mb[24]; snprintf(mb,sizeof mb,"MAPSIZE %d\n",m_settings.mapIdx); netSend(mb); netSend("START\n"); netStartPeer(); }
+        if(msg.rfind("JOINED ",0)==0){
+            int idx=atoi(msg.c_str()+7);
+            if(fromPeer){                       // 其他玩家加入了房间
+                if(m_netRole==0 && idx>=1 && idx<4) m_netJoined |= (1<<idx);
+            } else {                            // 服务器告诉我的编号
+                m_netPlayerIdx=idx;
             }
+            return;
+        }
+        if(msg.rfind("FULL ",0)==0){
+            m_netRoomSize=atoi(msg.c_str()+5);
+            if(m_netRoomSize!=2 && m_netRoomSize!=4) m_netRoomSize=2;
+            m_netRoomFull=true;
+            if(m_netRole==0) hostTryStart();
+            return;
+        }
+        if(msg.rfind("COLOR ",0)==0){           // 服务器已去重, 格式: PEER COLOR <玩家编号> <颜色>
+            int pidx=0,cidx=0;
+            sscanf(msg.c_str()+6,"%d %d",&pidx,&cidx);
+            if(pidx>=0 && pidx<4) m_netPlayerColors[pidx]=cidx;
+            if(m_netRole==0){ m_netPlayerColors[0]=m_netColor; hostTryStart(); }
+            return;
+        }
+        if(msg.rfind("COLORMAP ",0)==0){        // 房主广播的最终颜色表
+            int c0=0,c1=0,c2=0,c3=0;
+            sscanf(msg.c_str()+9,"%d %d %d %d",&c0,&c1,&c2,&c3);
+            m_netPlayerColors[0]=c0; m_netPlayerColors[1]=c1;
+            m_netPlayerColors[2]=c2; m_netPlayerColors[3]=c3;
             return;
         }
         if(msg.rfind("MAPSIZE ",0)==0){
@@ -1334,10 +1380,11 @@ private:
             if(idx>=0 && idx<=4){ m_settings.mapIdx=idx; applyMapSize(); saveSettings(); }
             return;
         }
-        if(msg=="START" && m_netRole==1){ netStartPeer(); return; }
-        if(msg=="TAKECOLOR" && m_netRole==1){
+        if(msg=="START"){ netStartPeer(); return; }
+        if(msg=="TAKECOLOR"){
             m_netColor=(m_netColor+1)%4;
             char b[24]; snprintf(b,sizeof b,"COLOR %d\n",m_netColor); netSend(b);
+            if(m_netRole==0){ m_netPlayerColors[0]=m_netColor; }
             return;
         }
         if(msg.rfind("SEED ",0)==0 && !m_netGotSeed){
@@ -1348,7 +1395,21 @@ private:
             m_netGotSeed=true;
             return;
         }
-        if(msg=="ENDTURN"){ m_netMyTurn=true; m_didBranch=false; advanceTurn(); return; }
+        if(msg=="ENDTURN"){
+            m_didBranch=false; m_xUsedThisTurn=false;
+            advanceTurn();
+            m_netMyTurn = teamEq(m_turn, CLR_TEAMS[m_netColor%4]);
+            m_enterClock.Restart();
+            return;
+        }
+        if(msg.rfind("EXTRA ",0)==0){           // 某玩家购买了额外行动, 同步扣分
+            int tm=atoi(msg.c_str()+6);
+            if(tm>=0 && tm<4){
+                SecureInt& sc=m_plyScores[tm%4];
+                if((int)sc>=EXTRA_COST) sc-=EXTRA_COST;
+            }
+            return;
+        }
         if(msg.rfind("MOVE ",0)==0){
             int tm=0,ty=0,s=1,e=0; float px=0,py=0,tx=0,ty2=0;
             sscanf(msg.c_str()+5, "tm=%d ty=%d px=%f py=%f tx=%f ty2=%f s=%d e=%d", &tm,&ty,&px,&py,&tx,&ty2,&s,&e);
@@ -1798,22 +1859,38 @@ private:
                     return;
                 }
                 return;
-            }else if(m_menuPhase==12){  // ---- 在线子菜单: 开房(Host) / 加入(Join) ----
-                if(vk==VK_DOWN){ m_menuSel=(m_menuSel+1)%2; return; }
-                if(vk==VK_UP){   m_menuSel=(m_menuSel+1)%2; return; }
+            }else if(m_menuPhase==12){  // ---- 在线子菜单: 人数 / 开房(Host) / 加入(Join) ----
+                if(vk==VK_DOWN){ m_menuSel=(m_menuSel+1)%3; return; }
+                if(vk==VK_UP){   m_menuSel=(m_menuSel+2)%3; return; }
                 if(vk==VK_ESCAPE){ m_menuPhase=3; m_menuSel=2; m_enterClock.Restart(); return; }
+                if((vk==VK_LEFT||vk==VK_RIGHT)&&m_menuSel==0){
+                    m_netRoomSize=(m_netRoomSize==2)?4:2;
+                    m_enterClock.Restart();
+                    return;
+                }
                 if(vk==VK_RETURN&&m_enterClock.GetElapsedTime()>0.5){
                     m_aiMode=false; m_bothAI=false; m_diff=1;
                     m_redPlugin=-1; m_bluePlugin=-1;
-                    if(m_menuSel==0){           // 开房: 输入服务器地址 → CREATE 房间
+                    if(m_menuSel==0){           // 切换人数
+                        m_netRoomSize=(m_netRoomSize==2)?4:2;
+                        m_enterClock.Restart();
+                        return;
+                    }
+                    if(m_menuSel==1){           // 开房: 输入服务器地址 → CREATE <n> 房间
+                        std::wstring defAddr = L"127.0.0.1:8080";
+                        if(m_settings.vpnEnable && !m_settings.vpnIP.empty())
+                            defAddr = std::wstring(m_settings.vpnIP.begin(),m_settings.vpnIP.end())+L":8080";
                         EnableWindow(m_hwnd, FALSE);
-                        std::string srv=promptInput(L"Enter room server address (e.g. myhost.com:8080)", L"127.0.0.1:8080");
+                        std::string srv=promptInput(L"Enter room server address (IPv4)", defAddr.c_str());
                         EnableWindow(m_hwnd, TRUE);
                         if(netHost(srv)) m_state=State::Playing;   // 进入 Waiting, 等 ROOM 码
                         else MessageBoxW(m_hwnd,(L"Host failed: "+std::wstring(m_netErrMsg.begin(),m_netErrMsg.end())).c_str(),L"Host",MB_OK|MB_ICONWARNING);
                     }else{                      // 加入: 输入 "服务器地址 房间码" → JOIN
+                        std::wstring defAddr = L"127.0.0.1:8080 ";
+                        if(m_settings.vpnEnable && !m_settings.vpnIP.empty())
+                            defAddr = std::wstring(m_settings.vpnIP.begin(),m_settings.vpnIP.end())+L":8080 ";
                         EnableWindow(m_hwnd, FALSE);
-                        std::string addr=promptInput(L"Enter: serverAddr roomCode  (e.g. myhost.com:8080 1234)", L"127.0.0.1:8080 ");
+                        std::string addr=promptInput(L"Enter: serverAddr roomCode  (e.g. 192.168.1.5:8080 1234)", defAddr.c_str());
                         EnableWindow(m_hwnd, TRUE);
                         if(!addr.empty()){
                             if(netJoin(addr)) m_state=State::Playing;
@@ -1883,10 +1960,10 @@ private:
                 }
                 return;
             }else if(m_menuPhase==8){   // ---- 设置页 ----
-                // 行: 0=地图尺寸 1=保存对局 2=游戏规则 3..5=快捷键开关
+                // 行: 0=地图尺寸 1=保存对局 2=游戏规则 3..5=快捷键开关 6=虚拟组网
                 if(vk==VK_ESCAPE){ m_menuPhase=0; m_menuSel=4; m_enterClock.Restart(); saveSettings(); return; }
-                if(vk==VK_DOWN){ m_menuSel=(m_menuSel+1)%6; return; }
-                if(vk==VK_UP){   m_menuSel=(m_menuSel+5)%6; return; }
+                if(vk==VK_DOWN){ m_menuSel=(m_menuSel+1)%7; return; }
+                if(vk==VK_UP){   m_menuSel=(m_menuSel+6)%7; return; }
                 if(vk==VK_RETURN&&m_enterClock.GetElapsedTime()>0.5){
                     if(m_menuSel==0){               // 地图尺寸 → 二级菜单
                         m_menuPhase=9; m_menuSel=m_settings.mapIdx; m_enterClock.Restart(); return;
@@ -1897,6 +1974,9 @@ private:
                     if(m_menuSel==2){               // 游戏规则 → 二级菜单 (数值)
                         m_menuPhase=11; m_menuSel=0; m_enterClock.Restart(); return;
                     }
+                    if(m_menuSel==6){               // 虚拟组网 → 二级菜单
+                        m_menuPhase=13; m_menuSel=0; m_enterClock.Restart(); return;
+                    }
                     // 快捷键开关: 仅按 Enter 切换 (3=B吸附 4=Ctrl+Z撤销 5=R深度)
                     bool* b = (m_menuSel==3)?&m_settings.snapEnabled
                            : (m_menuSel==4)?&m_settings.undoEnabled
@@ -1906,6 +1986,35 @@ private:
                     if(m_menuSel==5) m_showDepth   = m_settings.depthEnabled;
                     saveSettings();
                     m_enterClock.Restart();
+                    return;
+                }
+                return;
+            }else if(m_menuPhase==13){  // ---- 虚拟组网 (EasyTier/VPN) 二级菜单 ----
+                if(vk==VK_ESCAPE){ m_menuPhase=8; m_menuSel=6; m_enterClock.Restart(); saveSettings(); return; }
+                if(vk==VK_DOWN){ m_menuSel=(m_menuSel+1)%6; return; }
+                if(vk==VK_UP){   m_menuSel=(m_menuSel+5)%6; return; }
+                if(vk==VK_RETURN&&m_enterClock.GetElapsedTime()>0.5){
+                    if(m_menuSel==0){               // 启用开关
+                        m_settings.vpnEnable=!m_settings.vpnEnable;
+                        saveSettings(); m_enterClock.Restart(); return;
+                    }
+                    if(m_menuSel==5){               // 一键启动 EasyTier
+                        launchVpn(); m_enterClock.Restart(); return;
+                    }
+                    const wchar_t* title=nullptr;
+                    std::string* target=nullptr;
+                    if(m_menuSel==1){ title=L"EasyTier network name"; target=&m_settings.vpnName; }
+                    else if(m_menuSel==2){ title=L"Network secret (key)"; target=&m_settings.vpnSecret; }
+                    else if(m_menuSel==3){ title=L"Local virtual IP (e.g. 10.144.0.1)"; target=&m_settings.vpnIP; }
+                    else if(m_menuSel==4){ title=L"Custom launch command (empty=default)"; target=&m_settings.vpnCmd; }
+                    if(target){
+                        std::wstring wdef(target->begin(), target->end());
+                        EnableWindow(m_hwnd, FALSE);
+                        std::string r=promptInput(title, wdef.c_str());
+                        EnableWindow(m_hwnd, TRUE);
+                        if(!r.empty() || m_menuSel==3) *target=r;   // IP 允许清空
+                        saveSettings(); m_enterClock.Restart();
+                    }
                     return;
                 }
                 return;
@@ -1955,12 +2064,14 @@ private:
                 return;
             }
         }
-        // 在线等待/选色 (P2P: 1-4 选色, Esc 退出)
+        // 在线等待/选色 (房间服务器: 1-4 选色, Esc 退出)
         if(m_state==State::Playing && m_netWaiting){
             if(vk>='1'&&vk<='4'){
                 m_netColor=vk-'1';
                 if(m_netSock!=INVALID_SOCKET){
                     char b[24]; snprintf(b,sizeof b,"COLOR %d\n",m_netColor); netSend(b);
+                    if(m_netPlayerIdx>=0 && m_netPlayerIdx<4) m_netPlayerColors[m_netPlayerIdx]=m_netColor;
+                    if(m_netRole==0) hostTryStart();
                 }
                 return;
             }
@@ -2086,6 +2197,11 @@ private:
                 // 记录额外行动
                 recordAction(2, m_sel, m_mouse, 0, 0, scBefore, (int)sc, m_turn);
                 if(m_aiMode&&!m_bothAI&&teamEq(m_turn,CLR_BLUE)) m_aiRed.observePlayerAction(3);
+                // 在线: 通知所有客户端同步扣 3 分
+                if(m_netActive){
+                    char eb[24]; snprintf(eb,sizeof eb,"EXTRA %d\n",idxOfTeam(m_turn));
+                    netSend(eb);
+                }
             }
             return;
         }
@@ -2095,10 +2211,10 @@ private:
         if(vk==VK_RETURN&&!m_sel&&!m_reinf){
             if(m_enterClock.GetElapsedTime()<0.3)return;
             if(m_netActive){
-                // 在线: 发送回合结束, 等待对方
+                // 在线: 发送回合结束, 各端本地推进回合并判定是否本机行动
                 netSend("ENDTURN\n");
-                m_netMyTurn=false;
                 advanceTurn();
+                m_netMyTurn = teamEq(m_turn, CLR_TEAMS[m_netColor%4]);
             }else{
                 advanceTurn();
             }
@@ -2245,7 +2361,7 @@ private:
             Color(255,70,80,140),Color(255,180,60,70));
         g.FillRectangle(&grad,0,0,FULL_W,6);
 
-        textC(g,L"Binary Tree Battle V6.2.0",FULL_W/2.f,170,Color(255,25,25,30),40,true);
+        textC(g,L"Binary Tree Battle V6.3.0",FULL_W/2.f,170,Color(255,25,25,30),40,true);
         textC(g,L"ITERATIVE AI  SELF-LEARNING ENGINE",FULL_W/2.f,215,Color(255,120,120,130),15);
 
         // 装饰线
@@ -2273,27 +2389,25 @@ private:
             opt(m_menuSel==3?L"Replay (.btb)":L"  Replay (.btb)",562,m_menuSel==3);
             opt(m_menuSel==4?L"Settings":L"  Settings",606,m_menuSel==4);
         }else if(m_menuPhase==8){   // ---- 设置页 ----
-            textC(g,L"SETTINGS",FULL_W/2.f,392,Color(255,90,110,140),20,true);
+            textC(g,L"SETTINGS",FULL_W/2.f,388,Color(255,90,110,140),20,true);
             // 地图尺寸 (Enter 进入二级菜单)
             {
                 std::wstring s = L"Map Size:  ";
                 s += kMapName[m_settings.mapIdx];
                 s += L"    [Enter]";
-                textC(g,s.c_str(),FULL_W/2.f,428, m_menuSel==0?Color(255,20,20,25):Color(255,100,100,110),
+                textC(g,s.c_str(),FULL_W/2.f,424, m_menuSel==0?Color(255,20,20,25):Color(255,100,100,110),
                       m_menuSel==0?18.f:16.f, m_menuSel==0);
             }
             // 保存对局 (Enter 进入二级菜单, 分模式)
             {
-                std::wstring s = L"Save Replays:";
-                s += L"    [Enter]";
-                textC(g,s.c_str(),FULL_W/2.f,460, m_menuSel==1?Color(255,20,20,25):Color(255,100,100,110),
+                std::wstring s = L"Save Replays:    [Enter]";
+                textC(g,s.c_str(),FULL_W/2.f,456, m_menuSel==1?Color(255,20,20,25):Color(255,100,100,110),
                       m_menuSel==1?18.f:16.f, m_menuSel==1);
             }
             // 游戏规则 (Enter 进入二级菜单, 数值)
             {
-                std::wstring s = L"Game Rules:";
-                s += L"    [Enter]";
-                textC(g,s.c_str(),FULL_W/2.f,492, m_menuSel==2?Color(255,20,20,25):Color(255,100,100,110),
+                std::wstring s = L"Game Rules:    [Enter]";
+                textC(g,s.c_str(),FULL_W/2.f,488, m_menuSel==2?Color(255,20,20,25):Color(255,100,100,110),
                       m_menuSel==2?18.f:16.f, m_menuSel==2);
             }
             // 快捷键开关 (仅 Enter 切换; ON 绿色 / OFF 暗色)
@@ -2302,17 +2416,52 @@ private:
                 {L"Ctrl+Z -  Undo", &m_settings.undoEnabled},
                 {L"R      -  Depth Display", &m_settings.depthEnabled},
             };
-            float py=526;
-            for(int i=0;i<3;++i,py+=38){
+            float py=518;
+            for(int i=0;i<3;++i,py+=30){
                 bool sel = (m_menuSel==i+3);
                 bool on = *rows[i].val;
                 std::wstring s = rows[i].name;
                 s += on ? L"   [ON]" : L"   [OFF]";
-                Color c = on ? Color(255,40,190,70)                 // ON 绿色
+                Color c = on ? Color(255,40,190,70)
                              : (sel ? Color(255,20,20,25) : Color(255,110,110,120));
-                textC(g,s.c_str(),FULL_W/2.f,py,c, sel?18.f:16.f, sel||on);
+                textC(g,s.c_str(),FULL_W/2.f,py,c, sel?17.f:15.f, sel||on);
             }
-            textC(g,L"Enter: toggle    Esc: back",FULL_W/2.f,640,Color(255,150,150,158),13);
+            // 虚拟组网 (Enter 进入二级菜单)
+            {
+                std::wstring s = L"Virtual Network (EasyTier/VPN)    [Enter]";
+                Color c = m_settings.vpnEnable ? Color(255,40,190,70) : Color(255,110,110,120);
+                textC(g,s.c_str(),FULL_W/2.f,610, m_menuSel==6?Color(255,20,20,25):c,
+                      m_menuSel==6?18.f:16.f, m_menuSel==6||m_settings.vpnEnable);
+            }
+            textC(g,L"Enter: select/toggle    Esc: back",FULL_W/2.f,646,Color(255,150,150,158),13);
+        }else if(m_menuPhase==13){  // ---- 虚拟组网 (EasyTier/VPN) 二级菜单 ----
+            textC(g,L"VIRTUAL NETWORK (EasyTier/VPN)",FULL_W/2.f,388,Color(255,90,110,140),18,true);
+            const wchar_t* names[6]={
+                L"Enable Virtual Network",
+                L"Network Name",
+                L"Network Secret",
+                L"Local Virtual IP",
+                L"Custom Command",
+                L"Launch EasyTier Now",
+            };
+            std::wstring vals[6];
+            vals[0] = m_settings.vpnEnable ? L"[ON]" : L"[OFF]";
+            vals[1] = m_settings.vpnName.empty()?  L"(not set)" : std::wstring(m_settings.vpnName.begin(),m_settings.vpnName.end());
+            vals[2] = m_settings.vpnSecret.empty()?L"(not set)" : std::wstring(m_settings.vpnSecret.begin(),m_settings.vpnSecret.end());
+            vals[3] = m_settings.vpnIP.empty()?    L"(not set)" : std::wstring(m_settings.vpnIP.begin(),m_settings.vpnIP.end());
+            vals[4] = m_settings.vpnCmd.empty()?   L"(default easytier-core)" : std::wstring(m_settings.vpnCmd.begin(),m_settings.vpnCmd.end());
+            vals[5] = L"";
+            float py=424;
+            for(int i=0;i<6;++i,py+=38){
+                bool sel=(m_menuSel==i);
+                std::wstring s=names[i];
+                if(i==0) s += L"   "+vals[0];
+                else if(i<5) s += L":  "+vals[i];
+                Color c = (i==0&&m_settings.vpnEnable) ? Color(255,40,190,70)
+                       : (sel?Color(255,20,20,25):Color(255,110,110,120));
+                textC(g,s.c_str(),FULL_W/2.f,py,c, sel?18.f:16.f, sel||(i==0&&m_settings.vpnEnable));
+            }
+            textC(g,L"Enter: edit/toggle    Esc: back",FULL_W/2.f,652,Color(255,150,150,158),13);
         }else if(m_menuPhase==11){  // ---- 游戏规则二级菜单 (数值) ----
             textC(g,L"GAME RULES",FULL_W/2.f,392,Color(255,90,110,140),20,true);
             struct{ const wchar_t* name; int* v; } rows[] = {
@@ -2363,19 +2512,25 @@ private:
             textC(g,L"PVP MODE",FULL_W/2.f,412,Color(255,90,110,140),18,true);
             opt(m_menuSel==0?L"Local 2 Players":L"  Local 2 Players",456,m_menuSel==0);
             opt(m_menuSel==1?L"Local 4 Players (4 corners)":L"  Local 4 Players (4 corners)",496,m_menuSel==1);
-            opt(m_menuSel==2?L"Online (Peer to Peer)":L"  Online (Peer to Peer)",536,m_menuSel==2);
+            opt(m_menuSel==2?L"Online (Room Server)":L"  Online (Room Server)",536,m_menuSel==2);
             textC(g,L"Online: host a room or join via IP:port",FULL_W/2.f,586,
                   Color(255,130,130,140),13);
-            textC(g,L"Example: [240e:1234::1]:8080  or  192.168.1.5:8080",FULL_W/2.f,608,
+            textC(g,L"Example: 192.168.1.5:8080   (IPv4 only)",FULL_W/2.f,608,
                   Color(255,150,150,158),12);
-        }else if(m_menuPhase==12){  // ---- 在线子菜单: 开房 / 加入 (中央服务器) ----
-            textC(g,L"ONLINE (ROOM SERVER)",FULL_W/2.f,408,Color(255,90,110,140),18,true);
-            opt(m_menuSel==0?L"Host a Room":L"  Host a Room",452,m_menuSel==0);
-            opt(m_menuSel==1?L"Join by Room Code":L"  Join by Room Code",500,m_menuSel==1);
-            textC(g,L"Host: enter room-server address, get a room code",FULL_W/2.f,566,
+        }else if(m_menuPhase==12){  // ---- 在线子菜单: 人数 / 开房 / 加入 ----
+            textC(g,L"ONLINE (ROOM SERVER)",FULL_W/2.f,396,Color(255,90,110,140),18,true);
+            std::wstring cnt = (m_netRoomSize==4)?L"Players: 4    [←/→]":L"Players: 2    [←/→]";
+            opt(m_menuSel==0 ? cnt.c_str() : (L"  "+cnt).c_str(),444,m_menuSel==0);
+            opt(m_menuSel==1?L"Host a Room":L"  Host a Room",492,m_menuSel==1);
+            opt(m_menuSel==2?L"Join by Room Code":L"  Join by Room Code",540,m_menuSel==2);
+            if(m_settings.vpnEnable && !m_settings.vpnIP.empty()){
+                std::wstring s=L"VPN: "+std::wstring(m_settings.vpnIP.begin(),m_settings.vpnIP.end());
+                textC(g,s.c_str(),FULL_W/2.f,584,Color(255,0,170,90),13,true);
+            }
+            textC(g,L"Host: enter room-server address, get a room code",FULL_W/2.f,604,
                   Color(255,130,130,140),13);
-            textC(g,L"Join: enter 'serverAddr roomCode'  (e.g. myhost.com:8080 1234)",FULL_W/2.f,594,
-                  Color(255,150,150,158),13);
+            textC(g,L"Join: enter 'serverAddr roomCode'  (e.g. 192.168.1.5:8080 1234)",FULL_W/2.f,622,
+                  Color(255,150,150,158),12);
         }else if(m_menuPhase==1 || m_menuPhase==4 || m_menuPhase==6){
             // ===== AI 配置文件(dat) 列表: 1=vs AI红方, 4=AI Battle红方, 6=AI Battle蓝方 =====
             const wchar_t* datTitle = (m_menuPhase==4) ? L"RED  AI  —  select AI config (.dat)"
@@ -2426,13 +2581,13 @@ private:
         }
 
         // 闪烁 Enter 提示 (设置页与二级菜单不显示)
-        if(m_menuPhase!=8 && m_menuPhase!=9 && m_menuPhase!=10){
+        if(m_menuPhase!=8 && m_menuPhase!=9 && m_menuPhase!=10 && m_menuPhase!=13){
             float a=0.5f+0.5f*std::sin(GetTickCount64()*0.003f);
             Color blink(255,(int)(a*255),(int)(180+a*70),0);
             textC(g,L"Press ENTER to Start",FULL_W/2.f,646,blink,20,true);
         }
         text(g,L"Ctrl+R Restart",FULL_W-150.f,WIN_H-26,Color(255,150,150,150),12);
-        text(g,L"v6.2.0 Win32+GDI+",10,WIN_H-26,Color(255,150,150,150),12);
+        text(g,L"v6.3.0 Win32+GDI+",10,WIN_H-26,Color(255,150,150,150),12);
     }
 
     // ===== 对战渲染 =====
@@ -2445,17 +2600,18 @@ private:
         Pen bp(Color(90,200,205,215),2);
         g.DrawRectangle(&bp,1,1,WIN_W-2,WIN_H-2);
 
-        // 在线等待/选色 (P2P 广播)
+        // 在线等待/选色 (房间服务器: 2~4 人)
         if(m_netWaiting){
             float a=0.6f+0.4f*std::sin(GetTickCount64()*0.003f);
             const wchar_t* cn[4]={L"RED",L"BLUE",L"GREEN",L"YELLOW"};
+            std::wstring pcount = L"Players: " + std::to_wstring(m_netRoomSize);
             if(m_netRole==0 && m_netSock==INVALID_SOCKET){
                 textC(g,L"Hosting room - waiting for opponent...",WIN_W/2.f,WIN_H/2.f-64,
                       Color(255,(int)(60*a+60),(int)(160*a+60),220),26,true);
                 std::wstring srv(m_netServer.begin(),m_netServer.end());
                 textC(g,L"Share this address:  "+srv,WIN_W/2.f,WIN_H/2.f-18,Color(255,120,120,130),16,true);
             }else{
-                textC(g,L"Connected - pick your color",WIN_W/2.f,WIN_H/2.f-64,
+                textC(g,L"Connected - pick your color   ("+pcount+L")",WIN_W/2.f,WIN_H/2.f-64,
                       Color(255,(int)(60*a+60),(int)(160*a+60),220),26,true);
             }
             // 颜色选择
@@ -2464,14 +2620,17 @@ private:
                 s+=(k==m_netColor)?L"■":L"·";
                 s+=L"] ";
                 s+=cn[k];
-                textC(g,s.c_str(),WIN_W/2.f-120.f+k*80.f,WIN_H/2.f+2,
+                textC(g,s.c_str(),WIN_W/2.f-120.f+k*80.f,WIN_W/2.f+2,
                       k==m_netColor?CLR_TEAMS[k]:Color(255,150,150,155),
                       k==m_netColor?20.f:16.f, k==m_netColor);
             }
             textC(g,L"Press 1-4 to choose color   Esc: back",
                   WIN_W/2.f,WIN_H/2.f+46,Color(255,140,140,148),13);
-            if(m_netRole==1 && m_netOppColor<0)
-                textC(g,L"Waiting for host to confirm color...",WIN_W/2.f,WIN_H/2.f+72,
+            if(m_netRoomFull)
+                textC(g,L"Room full - waiting for host to start...",WIN_W/2.f,WIN_H/2.f+72,
+                      Color(255,170,150,80),12);
+            else if(m_netRole==1)
+                textC(g,L"Waiting for more players to join...",WIN_W/2.f,WIN_H/2.f+72,
                       Color(255,170,150,80),12);
             return;
         }
@@ -2783,9 +2942,13 @@ private:
         auto teamLabel=[&](int ti)->std::wstring{
             // 在线 P2P
             if(m_netActive){
-                std::wstring s = (ti==m_netColor)?cn[ti]:((ti==m_netOppColor)?cn[ti]:L"");
-                if(s.empty()) return s;
-                s += (ti==m_netColor)?L" (You)":L" (Opp)";
+                int owner=-1;
+                for(int j=0;j<m_players;++j)
+                    if(m_netPlayerColors[j]==ti){ owner=j; break; }
+                if(owner<0) return L"";
+                std::wstring s=cn[ti];
+                if(ti==m_netColor) s+=L" (You)";
+                else s+=L" (P"+std::to_wstring(owner)+L")";
                 return s;
             }
             // AI / 插件
@@ -2953,13 +3116,17 @@ private:
     std::vector<ScorePoint> m_initScores;        // 开局黄点快照 (写入 btbdt)
     std::vector<ScorePoint> m_scores;
 
-    // ===== 在线对战 (P2P 广播: 主机监听 / 加入方直连) =====
+    // ===== 在线对战 (房间服务器转发: 2~4 人) =====
     SOCKET m_netSock = INVALID_SOCKET;
-    SOCKET m_netListen= INVALID_SOCKET;   // 主机监听 socket
+    SOCKET m_netListen= INVALID_SOCKET;   // 预留: 主机监听 socket
     bool m_netActive = false;        // 在线对局中
-    int  m_netRole = 0;              // 0=主机(先手) 1=加入(后手)
+    int  m_netRole = 0;              // 0=主机(玩家0, 先手) 1=加入
     int  m_netColor = 0;             // 本机所选颜色索引 (0..3)
-    int  m_netOppColor = -1;         // 对方颜色索引 (-1=未知)
+    int  m_netRoomSize = 2;          // 房间人数 (2 / 4)
+    int  m_netPlayerIdx = 0;         // 本机玩家编号 (0=房主)
+    int  m_netPlayerColors[4] = {-1,-1,-1,-1};  // 玩家编号 → 颜色索引
+    int  m_netJoined = 1;            // 已加入玩家位图 (位0=房主)
+    bool m_netRoomFull = false;      // 房间是否已满
     bool m_netMyTurn = false;        // 是否本机回合
     bool m_netWaiting = false;       // 已连接等待配对/开始
     bool m_netGotSeed = false;       // 是否已收到黄点种子
@@ -3016,6 +3183,12 @@ private:
         int reinfCost   = 1;          // 每级分支/边强化消耗的积分 (0..3)
         int maxScorePts = 5;          // 场上得分点上限 (3..10)
         int initScorePts= 3;          // 开局得分点数量 (2..5)
+        // V6.3.0: 虚拟组网 (EasyTier 等) 设置
+        bool   vpnEnable = false;     // 启用虚拟网卡联机
+        std::string vpnName;          // EasyTier 网络名
+        std::string vpnSecret;        // EasyTier 网络密钥
+        std::string vpnIP;            // 本机虚拟 IP (开房/加入默认地址)
+        std::string vpnCmd;           // 自定义启动命令 (空=用默认 easytier-core)
     } m_settings;
     static inline const int kMapW[5] = {1000,1280,1280,1600,1920};
     static inline const int kMapH[5] = {700, 720, 1024, 900, 1080};
@@ -3024,22 +3197,30 @@ private:
         m_settings = GameSettings{};
         FILE* f = fopen("settings.dat","r");
         if(f){
-            char line[128];
+            char line[256];
             while(fgets(line,sizeof line,f)){
-                char k[32]={0},v[32]={0};
-                if(sscanf(line," %31[^= \t\r\n]=%31s",k,v)==2){
-                    if(!strcmp(k,"map_idx")) m_settings.mapIdx=atoi(v);
-                    else if(!strcmp(k,"snap"))   m_settings.snapEnabled  =atoi(v)!=0;
-                    else if(!strcmp(k,"undo"))   m_settings.undoEnabled  =atoi(v)!=0;
-                    else if(!strcmp(k,"depth"))  m_settings.depthEnabled =atoi(v)!=0;
-                    else if(!strcmp(k,"save_pvp")) m_settings.savePvp = atoi(v)!=0;
-                    else if(!strcmp(k,"save_pva")) m_settings.savePva = atoi(v)!=0;
-                    else if(!strcmp(k,"save_ava")) m_settings.saveAva = atoi(v)!=0;
-                    else if(!strcmp(k,"extend_max")) m_settings.extendMax = atoi(v);
-                    else if(!strcmp(k,"extend_cost")) m_settings.extendCost = atoi(v);
-                    else if(!strcmp(k,"reinf_cost")) m_settings.reinfCost = atoi(v);
-                    else if(!strcmp(k,"max_score_pts")) m_settings.maxScorePts = atoi(v);
-                    else if(!strcmp(k,"init_score_pts")) m_settings.initScorePts = atoi(v);
+                char k[48]={0}; char v[192]={0};
+                if(sscanf(line," %47[^= \t\r\n]=%191[^\r\n]",k,v)>=1){
+                    // 去值首尾空白
+                    char* s=v; while(*s==' '||*s=='\t') ++s;
+                    char* e=s+strlen(s); while(e>s && (e[-1]==' '||e[-1]=='\t'||e[-1]=='\r'||e[-1]=='\n')) --e; *e=0;
+                    if(!strcmp(k,"map_idx")) m_settings.mapIdx=atoi(s);
+                    else if(!strcmp(k,"snap"))   m_settings.snapEnabled  =atoi(s)!=0;
+                    else if(!strcmp(k,"undo"))   m_settings.undoEnabled  =atoi(s)!=0;
+                    else if(!strcmp(k,"depth"))  m_settings.depthEnabled =atoi(s)!=0;
+                    else if(!strcmp(k,"save_pvp")) m_settings.savePvp = atoi(s)!=0;
+                    else if(!strcmp(k,"save_pva")) m_settings.savePva = atoi(s)!=0;
+                    else if(!strcmp(k,"save_ava")) m_settings.saveAva = atoi(s)!=0;
+                    else if(!strcmp(k,"extend_max")) m_settings.extendMax = atoi(s);
+                    else if(!strcmp(k,"extend_cost")) m_settings.extendCost = atoi(s);
+                    else if(!strcmp(k,"reinf_cost")) m_settings.reinfCost = atoi(s);
+                    else if(!strcmp(k,"max_score_pts")) m_settings.maxScorePts = atoi(s);
+                    else if(!strcmp(k,"init_score_pts")) m_settings.initScorePts = atoi(s);
+                    else if(!strcmp(k,"vpn_enable")) m_settings.vpnEnable = atoi(s)!=0;
+                    else if(!strcmp(k,"vpn_name"))   m_settings.vpnName = s;
+                    else if(!strcmp(k,"vpn_secret")) m_settings.vpnSecret = s;
+                    else if(!strcmp(k,"vpn_ip"))     m_settings.vpnIP = s;
+                    else if(!strcmp(k,"vpn_cmd"))    m_settings.vpnCmd = s;
                 }
             }
             fclose(f);
@@ -3065,7 +3246,30 @@ private:
         fprintf(f,"reinf_cost=%d\n",m_settings.reinfCost);
         fprintf(f,"max_score_pts=%d\n",m_settings.maxScorePts);
         fprintf(f,"init_score_pts=%d\n",m_settings.initScorePts);
+        fprintf(f,"vpn_enable=%d\n",m_settings.vpnEnable?1:0);
+        fprintf(f,"vpn_name=%s\n",m_settings.vpnName.c_str());
+        fprintf(f,"vpn_secret=%s\n",m_settings.vpnSecret.c_str());
+        fprintf(f,"vpn_ip=%s\n",m_settings.vpnIP.c_str());
+        fprintf(f,"vpn_cmd=%s\n",m_settings.vpnCmd.c_str());
         fclose(f);
+    }
+    // 启动虚拟组网软件 (EasyTier 等): 优先自定义命令, 否则用默认 easytier-core
+    void launchVpn(){
+        std::string cmd = m_settings.vpnCmd;
+        if(cmd.empty())
+            cmd = "easytier-core -n " + m_settings.vpnName + " -s " + m_settings.vpnSecret;
+        int n=MultiByteToWideChar(CP_UTF8,0,cmd.c_str(),-1,nullptr,0);
+        std::wstring wcmd;
+        if(n>0){ wcmd.resize(n); MultiByteToWideChar(CP_UTF8,0,cmd.c_str(),-1,&wcmd[0],n); }
+        // cmd /c start 新开最小化窗口运行, 不阻塞游戏
+        std::wstring full = L"/c start \"EasyTier\" /min " + wcmd;
+        HINSTANCE hr = ShellExecuteW(nullptr,L"open",L"cmd.exe",full.c_str(),nullptr,SW_HIDE);
+        if((INT_PTR)hr<=32){
+            MessageBoxW(m_hwnd,
+                L"Failed to launch VPN software.\n\n"
+                L"Install EasyTier (easytier-core) or set a custom command in Settings.",
+                L"Virtual Network",MB_OK|MB_ICONWARNING);
+        }
     }
     void applyMapSize(){        // 更新全局地图尺寸并调整窗口 (居中显示)
         WIN_W = kMapW[m_settings.mapIdx];
