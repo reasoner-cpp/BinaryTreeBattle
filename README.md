@@ -14,8 +14,8 @@ A turn-based tree-building tactics game for Windows. Grow a binary tree from you
 
 - Self-learning AI — Alpha-Beta search, forward simulation, learns from replays
 - AI plugin SDK — write your own AI, drop a DLL into `ai_plugins\`
-- Online PvP for 2 or 4 players (IPv4) through a room relay server
-- EasyTier / ZeroTier / Tailscale virtual-network support (`btbserver` + one-click launch)
+- Online PvP for 2 or 4 players (IPv4) through a room relay server — hosting a room only needs a port: the game auto-detects your IPv4 address and auto-starts `btbserver`
+- EasyTier / ZeroTier / Tailscale virtual-network support (auto IPv4 detection + one-click launch)
 - Replay system with full action timeline and seek bar
 - Self-play evaluator (`selfplay2`)
 
@@ -31,7 +31,7 @@ cmake --build build --config Release
 | Target | Purpose |
 |---|---|
 | `BinaryTreeBattle.exe` | Main game |
-| `btbserver.exe` | Online room server (default port 8080) |
+| `btbserver.exe` | Online room server (default port 8080; auto-started when you host) |
 | `selfplay2.exe` | Self-play evaluation |
 | `sample_ai.dll` | Example AI plugin (`build/ai_plugins/`) |
 

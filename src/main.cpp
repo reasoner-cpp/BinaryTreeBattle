@@ -52,6 +52,8 @@
 #include <commdlg.h>
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "comdlg32.lib")
+#include <iphlpapi.h>
+#pragma comment(lib, "iphlpapi.lib")
 
 #include "ai.h"
 
@@ -329,6 +331,43 @@ static bool rawConnect(const std::string& serverAddr, SOCKET& outSock, std::stri
     }
     outSock=s;
     return true;
+}
+
+// 枚举本机所有非回环 IPv4 地址 (含虚拟网卡, 如 EasyTier/Tailscale)
+static std::vector<std::string> localIPv4s(){
+    std::vector<std::string> out;
+    ULONG sz = 0;
+    GetAdaptersAddresses(AF_INET, 0, nullptr, nullptr, &sz);
+    if(sz==0) return out;
+    std::vector<BYTE> buf(sz);
+    PIP_ADAPTER_ADDRESSES p = (PIP_ADAPTER_ADDRESSES)buf.data();
+    if(GetAdaptersAddresses(AF_INET, 0, nullptr, p, &sz) != NO_ERROR) return out;
+    for(; p; p=p->Next){
+        if(p->OperStatus != IfOperStatusUp) continue;
+        for(PIP_ADAPTER_UNICAST_ADDRESS ua = p->FirstUnicastAddress; ua; ua=ua->Next){
+            sockaddr_in* sa = (sockaddr_in*)ua->Address.lpSockaddr;
+            if(sa->sin_family != AF_INET) continue;
+            ULONG a = ntohl(sa->sin_addr.S_un.S_addr);
+            if((a>>24)==127 || (a>>24)==0) continue;                     // 环回/未指定
+            if((a>>24)==169 && ((a>>16)&0xff)==254) continue;            // APIPA 链路本地
+            char ip[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &sa->sin_addr, ip, sizeof ip);
+            out.push_back(ip);
+        }
+    }
+    return out;
+}
+
+// 启动与游戏同目录的 btbserver.exe (隐藏窗口)
+static void launchLocalServer(int port){
+    wchar_t exe[MAX_PATH];
+    DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring dir = (n>0)?std::wstring(exe, n):L".";
+    size_t slash = dir.find_last_of(L"\\/");
+    if(slash!=std::wstring::npos) dir = dir.substr(0, slash+1);
+    std::wstring btb = dir + L"btbserver.exe";
+    wchar_t portstr[16]; swprintf(portstr, 16, L"%d", port);
+    ShellExecuteW(nullptr, L"open", btb.c_str(), portstr, nullptr, SW_HIDE);
 }
 
 // ===== 游戏类 =====
@@ -1269,9 +1308,31 @@ private:
         }
     }
     // ===== 联机对战: 异步连接 (后台线程执行 DNS+connect, UI 不阻塞) =====
-    // 发起开房: 连接服务器, 完成后自动发送 CREATE 并进入等待
-    void netHostStart(const std::string& serverAddr){
-        netConnBegin(true, serverAddr);
+    // 发起开房: 输入端口(或完整地址) → 自动本机托管/检测对外 IPv4
+    void netHostStart(const std::string& input){
+        m_netAutoLaunch=false;
+        std::string target = input;
+        // 兼容: 输入完整 "IP:port" 时按远程服务器处理
+        if(input.find(':') != std::string::npos){
+            target = input;
+        } else {
+            // 只输入端口 → 本机托管: 连接 127.0.0.1, 自动启动 btbserver, 展示检测到的对外地址
+            int port = 8080;
+            if(!input.empty()) port = atoi(input.c_str());
+            if(port<=0 || port>65535) port = 8080;
+            m_netAutoLaunch=true;
+            m_netHostPort = port;
+            m_netLocalIPs = localIPv4s();
+            std::string share;
+            if(m_settings.vpnEnable && !m_settings.vpnIP.empty()) share = m_settings.vpnIP;   // 虚拟地址优先
+            else if(!m_netLocalIPs.empty()) share = m_netLocalIPs[0];
+            else share = "127.0.0.1";
+            m_netShareAddr = share + ":" + std::to_string(port);
+            target = "127.0.0.1:" + std::to_string(port);
+        }
+        netConnBegin(true, target);
+        if(!m_netAutoLaunch) m_netShareAddr = input;   // 远程托管: 展示输入的地址
+        m_netServer = m_netShareAddr;                  // 等待界面: "Share this address: <addr>"
     }
     // 发起加入: 连接服务器, 完成后自动发送 JOIN 并进入等待
     void netJoinStart(const std::string& serverAndRoom){
@@ -1294,7 +1355,7 @@ private:
         for(int i=0;i<4;++i) m_netPlayerColors[i]=-1;
         m_netRoomFull=false; m_netJoined=1;
         if(isHost) m_netPlayerColors[0]=m_netColor;
-        m_netServer = "Connecting to "+arg+"...";
+        m_netServer = isHost ? m_netShareAddr : ("Connecting to "+arg+"...");
         m_netErrMsg.clear();
 
         m_netConnecting=true; m_netConnHost=isHost; m_netConnArg=arg;
@@ -1304,6 +1365,13 @@ private:
         m_netConnThread = std::thread([this, gen, arg](){
             SOCKET s=INVALID_SOCKET; std::string err;
             bool ok = rawConnect(arg, s, err);
+            // 本机托管: 连接被拒(btbserver 未启动)时自动启动并重试
+            if(!ok && m_netAutoLaunch && err.find("10061")!=std::string::npos){
+                if(s!=INVALID_SOCKET){ closesocket(s); s=INVALID_SOCKET; }
+                launchLocalServer(m_netHostPort);
+                Sleep(1200);
+                ok = rawConnect(arg, s, err);
+            }
             std::lock_guard<std::mutex> lk(m_netConnMtx);
             if(gen!=m_netConnGen || !m_netConnecting){   // 已取消/过期
                 if(s!=INVALID_SOCKET) closesocket(s);
@@ -1973,12 +2041,9 @@ private:
                         m_enterClock.Restart();
                         return;
                     }
-                    if(m_menuSel==1){           // 开房: 输入服务器地址 → 异步连接并 CREATE <n>
-                        std::wstring defAddr = L"127.0.0.1:8080";
-                        if(m_settings.vpnEnable && !m_settings.vpnIP.empty())
-                            defAddr = std::wstring(m_settings.vpnIP.begin(),m_settings.vpnIP.end())+L":8080";
+                    if(m_menuSel==1){           // 开房: 输入端口 → 自动本机托管并生成对外 IPv4 地址
                         EnableWindow(m_hwnd, FALSE);
-                        std::string srv=promptInput(L"Enter room server address (IPv4)", defAddr.c_str());
+                        std::string srv=promptInput(L"Enter room server port (auto IPv4 address)", L"8080");
                         EnableWindow(m_hwnd, TRUE);
                         if(!srv.empty()) netHostStart(srv);   // 异步连接, UI 不阻塞
                     }else{                      // 加入: 输入 "服务器地址 房间码" → 异步连接并 JOIN
@@ -2702,11 +2767,23 @@ private:
                 return;
             }
             std::wstring pcount = L"Players: " + std::to_wstring(m_netRoomSize);
-            if(m_netRole==0 && m_netSock==INVALID_SOCKET){
-                textC(g,L"Hosting room - waiting for opponent...",WIN_W/2.f,WIN_H/2.f-64,
-                      Color(255,(int)(60*a+60),(int)(160*a+60),220),26,true);
+            if(m_netRole==0){
+                // 房主: 始终显示对外分享地址
+                textC(g,L"Hosting room - waiting for opponent...",WIN_W/2.f,WIN_H/2.f-72,
+                      Color(255,(int)(60*a+60),(int)(160*a+60),220),24,true);
                 std::wstring srv(m_netServer.begin(),m_netServer.end());
-                textC(g,L"Share this address:  "+srv,WIN_W/2.f,WIN_H/2.f-18,Color(255,120,120,130),16,true);
+                textC(g,L"Share this address:  "+srv,WIN_W/2.f,WIN_H/2.f-42,
+                      Color(255,255,215,0),20,true);
+                // 备选地址 (多网卡/虚拟网卡)
+                if(m_netLocalIPs.size()>1){
+                    std::wstring alt=L"Also: ";
+                    for(size_t i=1;i<m_netLocalIPs.size() && i<4;++i){
+                        if(i>1) alt+=L"   ";
+                        alt += std::wstring(m_netLocalIPs[i].begin(),m_netLocalIPs[i].end());
+                    }
+                    alt += L":"+std::to_wstring(m_netHostPort);
+                    textC(g,alt.c_str(),WIN_W/2.f,WIN_H/2.f-20,Color(255,150,150,160),12,false);
+                }
             }else{
                 textC(g,L"Connected - pick your color   ("+pcount+L")",WIN_W/2.f,WIN_H/2.f-64,
                       Color(255,(int)(60*a+60),(int)(160*a+60),220),26,true);
@@ -3224,6 +3301,11 @@ private:
     std::string m_netConnArg;    // 连接参数 (地址 或 地址+房间码)
     SOCKET m_netConnSock = INVALID_SOCKET;
     std::string m_netConnErr;    // 失败原因
+    // 本机托管 (Host 输入端口) 相关
+    bool m_netAutoLaunch = false;        // 是否自动启动本机 btbserver
+    int  m_netHostPort = 8080;           // 本机托管端口
+    std::vector<std::string> m_netLocalIPs;  // 检测到的本机 IPv4 列表
+    std::string m_netShareAddr;          // 对外分享地址 (IP:port)
 
     SOCKET m_netSock = INVALID_SOCKET;
     SOCKET m_netListen= INVALID_SOCKET;   // 预留: 主机监听 socket

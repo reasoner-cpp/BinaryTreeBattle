@@ -34,6 +34,6 @@ endif()
 
 # Windows 系统自带库 (仅依赖系统自带, 无需第三方)
 # 显式列出便于 MinGW 链接; MSVC 下与源码中的 #pragma comment(lib) 等价, 二者共存无害
-target_link_libraries(BinaryTreeBattle PRIVATE gdiplus ws2_32 shell32 winmm comdlg32)
+target_link_libraries(BinaryTreeBattle PRIVATE gdiplus ws2_32 shell32 winmm comdlg32 iphlpapi)
 target_link_libraries(selfplay2 PRIVATE gdiplus)
 target_link_libraries(btbserver PRIVATE ws2_32)
