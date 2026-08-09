@@ -367,7 +367,17 @@ static void launchLocalServer(int port){
     if(slash!=std::wstring::npos) dir = dir.substr(0, slash+1);
     std::wstring btb = dir + L"btbserver.exe";
     wchar_t portstr[16]; swprintf(portstr, 16, L"%d", port);
-    ShellExecuteW(nullptr, L"open", btb.c_str(), portstr, nullptr, SW_HIDE);
+    // 优先 CreateProcess (可靠, 无控制台); 失败回退 ShellExecuteW
+    std::wstring cmdline = L"\"" + btb + L"\" " + portstr;
+    STARTUPINFOW si{}; si.cb=sizeof si; si.dwFlags=STARTF_USESHOWWINDOW; si.wShowWindow=SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    BOOL ok = CreateProcessW(nullptr, &cmdline[0], nullptr, nullptr, FALSE,
+                             CREATE_NO_WINDOW, nullptr, dir.c_str(), &si, &pi);
+    if(ok){
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    } else {
+        ShellExecuteW(nullptr, L"open", btb.c_str(), portstr, nullptr, SW_HIDE);
+    }
 }
 
 // ===== 游戏类 =====
@@ -1381,12 +1391,14 @@ private:
         m_netConnThread = std::thread([this, gen, arg](){
             SOCKET s=INVALID_SOCKET; std::string err;
             bool ok = rawConnect(arg, s, err);
-            // 本机托管: 连接被拒(btbserver 未启动)时自动启动并重试
-            if(!ok && m_netAutoLaunch && err.find("10061")!=std::string::npos){
+            // 本机托管: 任何连接失败都启动本机 btbserver 并多次重试 (等待其就绪)
+            if(!ok && m_netAutoLaunch){
                 if(s!=INVALID_SOCKET){ closesocket(s); s=INVALID_SOCKET; }
                 launchLocalServer(m_netHostPort);
-                Sleep(1200);
-                ok = rawConnect(arg, s, err);
+                for(int i=0;i<12 && !ok;++i){     // 最多重试约 6 秒
+                    Sleep(500);
+                    ok = rawConnect(arg, s, err);
+                }
             }
             std::lock_guard<std::mutex> lk(m_netConnMtx);
             if(gen!=m_netConnGen || !m_netConnecting){   // 已取消/过期
@@ -1531,7 +1543,14 @@ private:
         std::string msg=line;
         if(msg.rfind("PEER ",0)==0){ fromPeer=true; msg=msg.substr(5); }
         if(msg.rfind("BYE",0)==0){ netOppLeft(); return; }
-        if(msg.rfind("ROOM ",0)==0){ m_netServer="Room code: "+msg.substr(5); return; }   // 开房成功
+        if(msg.rfind("ROOM ",0)==0){               // 开房成功
+            m_netRoomCode = msg.substr(5);
+            if(m_netRole==0 && !m_netShareAddr.empty())
+                m_netServer = m_netShareAddr + "  " + m_netRoomCode;   // 供他人直接复制加入
+            else
+                m_netServer = "Room code: " + m_netRoomCode;
+            return;
+        }
         if(msg.rfind("JOINED ",0)==0){
             int idx=atoi(msg.c_str()+7);
             if(fromPeer){                       // 其他玩家加入了房间
@@ -2843,12 +2862,16 @@ private:
             }
             std::wstring pcount = L"Players: " + std::to_wstring(m_netRoomSize);
             if(m_netRole==0){
-                // 房主: 始终显示对外分享地址
-                textC(g,L"Hosting room - waiting for opponent...",WIN_W/2.f,WIN_H/2.f-72,
+                // 房主: 始终显示对外分享地址 + 房间码 (等其他人加入后自动开始)
+                textC(g,L"Hosting room - waiting for players...",WIN_W/2.f,WIN_H/2.f-72,
                       Color(255,(int)(60*a+60),(int)(160*a+60),220),24,true);
                 std::wstring srv(m_netServer.begin(),m_netServer.end());
-                textC(g,L"Share this address:  "+srv,WIN_W/2.f,WIN_H/2.f-42,
+                textC(g,L"Send to others (serverAddr roomCode):",WIN_W/2.f,WIN_H/2.f-48,
+                      Color(255,180,200,255),14,false);
+                textC(g,L"  "+srv,WIN_W/2.f,WIN_H/2.f-30,
                       Color(255,255,215,0),20,true);
+                textC(g,L"Others: Online > Join > paste this",WIN_W/2.f,WIN_H/2.f-10,
+                      Color(255,150,160,180),12,false);
                 // 备选地址 (多网卡/虚拟网卡)
                 if(m_netLocalIPs.size()>1){
                     std::wstring alt=L"Also: ";
@@ -3409,6 +3432,7 @@ private:
     int  m_netHostPort = 8080;           // 本机托管端口
     std::vector<std::string> m_netLocalIPs;  // 检测到的本机 IPv4 列表
     std::string m_netShareAddr;          // 对外分享地址 (IP:port)
+    std::string m_netRoomCode;           // 房间码
 
     SOCKET m_netSock = INVALID_SOCKET;
     SOCKET m_netListen= INVALID_SOCKET;   // 预留: 主机监听 socket
