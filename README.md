@@ -16,7 +16,7 @@ A turn-based tree-building tactics game for Windows. Grow a binary tree from you
 - AI plugin SDK — write your own AI, drop a DLL into `ai_plugins\`
 - Online PvP through a lightweight room relay server
 - Replay system with full action timeline and seek bar
-- Self-play evaluator (`selfplay2`) + Python replay analysis tools
+- Self-play evaluator (`selfplay2`)
 
 ## Build
 
@@ -37,15 +37,6 @@ cmake --build build --config Release
 ## AI plugins
 
 Compile your DLL and copy it into `ai_plugins\`. Guide: `docs/AI_Plugin_Guide.md`. Example + build script: `SDK/`.
-
-## Replay analysis tools
-
-Python scripts in `tools/` parse `.btb` / `.btbdt` replays:
-
-- `analyze_btbdt.py` — behavior stats
-- `analyze_v5.py` — score-point competition & turning points
-- `deep_analyze.py` — winning tactics
-- `dump_game.py` — full game timeline
 
 ## Docs
 

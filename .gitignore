@@ -14,10 +14,6 @@ build*/
 *.btb
 *.btbdt
 
-# ===== Python =====
-__pycache__/
-*.pyc
-
 # ===== IDE / 编辑器 =====
 .vscode/
 .idea/
