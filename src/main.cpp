@@ -1497,6 +1497,7 @@ private:
     // 房主: 当房间满员且各玩家颜色唯一时, 广播开局并本地开局
     void hostTryStart(){
         if(m_netRole!=0) return;
+        if(!m_netWaiting) return;                 // 已开局则不再重复触发
         int need = m_netRoomSize;
         if(need!=2 && need!=4) need=2;
         // 房间是否满员 (房主自己 + 已加入位图)
@@ -1531,10 +1532,21 @@ private:
         m_netWaiting=false;
         m_all.clear(); m_scores.clear(); m_history.clear();
         for(int i=0;i<4;++i) m_roots[i].reset();
+        // 保证每名玩家使用唯一颜色 (根按颜色索引, 防止颜色碰撞覆盖掉根节点)
+        bool usedC[4]={false,false,false,false};
+        for(int j=0;j<m_players;++j){
+            int c = m_netPlayerColors[j];
+            if(c<0 || c>3 || usedC[c]){
+                c=-1;
+                for(int k=0;k<4;++k) if(!usedC[k]){ c=k; break; }
+                if(c<0) c = j%4;
+                m_netPlayerColors[j]=c;
+            }
+            usedC[c]=true;
+        }
         int corners[4][2] = {{80,80},{WIN_W-80,WIN_H-80},{WIN_W-80,80},{80,WIN_H-80}};
         for(int j=0;j<m_players;++j){
             int c = m_netPlayerColors[j];
-            if(c<0 || c>3) c = j%4;
             m_roots[c] = std::make_unique<Node>(Node{{(float)corners[c][0],(float)corners[c][1]}, CLR_TEAMS[c]});
             m_all.push_back(m_roots[c].get());
         }
@@ -2378,7 +2390,11 @@ private:
                 m_netColor=vk-'1';
                 int me = (m_netPlayerIdx>=0 && m_netPlayerIdx<4)? m_netPlayerIdx : 0;
                 m_netPlayerColors[me]=m_netColor;
-                char b[24]; snprintf(b,sizeof b,"COLOR %d\n",m_netColor); netSend(b);   // 房主广播/客户端发给房主
+                if(m_netRole==0){
+                    char b[32]; snprintf(b,sizeof b,"COLOR 0 %d\n",m_netColor); netSend(b);  // 房主广播(含玩家编号0)
+                } else {
+                    char b[24]; snprintf(b,sizeof b,"COLOR %d\n",m_netColor); netSend(b);    // 客户端发给房主
+                }
                 if(m_netRole==0) hostTryStart();
                 return;
             }
