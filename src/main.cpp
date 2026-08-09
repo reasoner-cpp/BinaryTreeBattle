@@ -44,6 +44,7 @@
 #include <map>
 #include <functional>
 #include <thread>
+#include <mutex>
 #include <ctime>
 #include <shellapi.h>
 #pragma comment(lib,"shell32.lib")
@@ -274,6 +275,62 @@ static Color hsvColor(float h, float s, float v){
     return Color(255,(BYTE)((r+m)*255.f),(BYTE)((g+m)*255.f),(BYTE)((b+m)*255.f));
 }
 
+// ===== 纯连接逻辑 (线程安全, 不触碰任何 Game 状态) =====
+// 解析 IPv4 host:port → 建立非阻塞 TCP 连接; 失败返回 false 并填 err
+static bool rawConnect(const std::string& serverAddr, SOCKET& outSock, std::string& err){
+    outSock = INVALID_SOCKET;
+    // 解析 host:port (IPv4 only)
+    std::string host=serverAddr, port="8080";
+    size_t colon=serverAddr.rfind(':');
+    if(colon!=std::string::npos){
+        host=serverAddr.substr(0,colon);
+        port=serverAddr.substr(colon+1);
+    }
+    // 去首尾空白
+    auto trim=[](std::string& s){
+        size_t a=s.find_first_not_of(" \t\r\n"); if(a==std::string::npos) s.clear();
+        else { size_t b=s.find_last_not_of(" \t\r\n"); s=s.substr(a,b-a+1); }
+    };
+    trim(host); trim(port);
+    if(host.empty()){ err="Address is empty"; return false; }
+    if(host=="0.0.0.0"){
+        err="0.0.0.0 is not connectable.\nUse the server's LAN or VPN IP (e.g. 192.168.1.5:8080).";
+        return false;
+    }
+    if(port.empty()) port="8080";
+    addrinfo hints{}, *res=nullptr;
+    hints.ai_family=AF_INET; hints.ai_socktype=SOCK_STREAM;
+    int gai=getaddrinfo(host.c_str(), port.c_str(), &hints, &res);
+    if(gai!=0){ err="Cannot resolve \""+host+"\""; return false; }
+    if(!res){ err="No address for \""+host+"\""; return false; }
+    SOCKET s=INVALID_SOCKET; int lastErr=0;
+    for(auto* p=res; p; p=p->ai_next){
+        s=socket(p->ai_family,p->ai_socktype,p->ai_protocol);
+        if(s==INVALID_SOCKET){ lastErr=WSAGetLastError(); continue; }
+        u_long mode=1; ioctlsocket(s,FIONBIO,&mode);
+        int r=connect(s,p->ai_addr,(int)p->ai_addrlen);
+        if(r!=0){
+            int e=WSAGetLastError();
+            if(e==WSAEWOULDBLOCK){
+                fd_set wf; FD_ZERO(&wf); FD_SET(s,&wf); timeval tv{3,0};
+                r=select(0,nullptr,&wf,nullptr,&tv);
+                if(r<=0){ lastErr=(r==0)?WSAETIMEDOUT:e; closesocket(s); s=INVALID_SOCKET; continue; }
+                int soe=0, sl=sizeof soe; getsockopt(s,SOL_SOCKET,SO_ERROR,(char*)&soe,&sl);
+                if(soe!=0){ lastErr=soe; closesocket(s); s=INVALID_SOCKET; continue; }
+            }else{ lastErr=e; closesocket(s); s=INVALID_SOCKET; continue; }
+        }
+        break;
+    }
+    freeaddrinfo(res);
+    if(s==INVALID_SOCKET){
+        err = (lastErr==WSAETIMEDOUT) ? "Connect timed out (check address)"
+              : ("Connect failed (WSA error "+std::to_string(lastErr)+")");
+        return false;
+    }
+    outSock=s;
+    return true;
+}
+
 // ===== 游戏类 =====
 class Game {
 public:
@@ -377,7 +434,8 @@ private:
 
     void frame(float dt){
         (void)dt;
-        // 联机: 每帧轮询网络消息 (配对/对方动作/回合切换)
+        // 联机: 处理异步连接完成 + 每帧轮询网络消息
+        if(m_state==State::Playing) netConnPoll();
         if(m_state==State::Playing) netPoll();
         // AI 回合: 迭代思考驱动 (思考中实时展示选点动画)
         if(m_state==State::Playing&&!m_over){
@@ -1210,71 +1268,110 @@ private:
             if(host.empty()) host="127.0.0.1";
         }
     }
-    // 连接房间服务器 (出站, 无需开放入站端口)
-    bool netConnectServer(const std::string& serverAddr){
-        std::string host, port;
-        parseHostPort(serverAddr, host, port);
-        addrinfo hints{}, *res=nullptr;
-        hints.ai_family=AF_INET; hints.ai_socktype=SOCK_STREAM;
-        int gai=getaddrinfo(host.c_str(), port.c_str(), &hints, &res);
-        if(gai!=0){ m_netErrMsg="Cannot resolve server \""+host+"\""; return false; }
-        SOCKET s=INVALID_SOCKET; int lastErr=0;
-        for(auto* p=res; p; p=p->ai_next){
-            s=socket(p->ai_family,p->ai_socktype,p->ai_protocol);
-            if(s==INVALID_SOCKET){ lastErr=WSAGetLastError(); continue; }
-            u_long mode=1; ioctlsocket(s,FIONBIO,&mode);
-            int r=connect(s,p->ai_addr,(int)p->ai_addrlen);
-            if(r!=0){
-                int e=WSAGetLastError();
-                if(e==WSAEWOULDBLOCK){
-                    fd_set wf; FD_ZERO(&wf); FD_SET(s,&wf); timeval tv{8,0};
-                    r=select(0,nullptr,&wf,nullptr,&tv);
-                    if(r<=0){ lastErr=(r==0)?WSAETIMEDOUT:e; closesocket(s); s=INVALID_SOCKET; continue; }
-                    int soe=0, sl=sizeof soe; getsockopt(s,SOL_SOCKET,SO_ERROR,(char*)&soe,&sl);
-                    if(soe!=0){ lastErr=soe; closesocket(s); s=INVALID_SOCKET; continue; }
-                }else{ lastErr=e; closesocket(s); s=INVALID_SOCKET; continue; }
-            }
-            break;
-        }
-        freeaddrinfo(res);
-        if(s==INVALID_SOCKET){
-            m_netErrMsg = (lastErr==WSAETIMEDOUT) ? "Connect to server timed out (check address)"
-                          : "Connect to server failed (error "+std::to_string(lastErr)+")";
-            return false;
-        }
-        u_long nm=1; ioctlsocket(s,FIONBIO,&nm);
-        m_netSock=s; m_netBuf.clear();
-        m_netActive=false; m_netGotSeed=false; m_netOppLeft=false;
+    // ===== 联机对战: 异步连接 (后台线程执行 DNS+connect, UI 不阻塞) =====
+    // 发起开房: 连接服务器, 完成后自动发送 CREATE 并进入等待
+    void netHostStart(const std::string& serverAddr){
+        netConnBegin(true, serverAddr);
+    }
+    // 发起加入: 连接服务器, 完成后自动发送 JOIN 并进入等待
+    void netJoinStart(const std::string& serverAndRoom){
+        netConnBegin(false, serverAndRoom);
+    }
+    // 发起一次异步连接 (isHost: 开房 / 加入)
+    void netConnBegin(bool isHost, const std::string& arg){
+        std::lock_guard<std::mutex> lk(m_netConnMtx);
+        if(m_netConnecting) return;                    // 已有连接进行中
+        // 重置陈旧的对局/AI 状态, 防止残留状态引发崩溃
+        m_aiMode=false; m_bothAI=false;
+        m_aiThinking=false; m_thinkingAI=nullptr;
+        m_over=false; m_didBranch=false; m_xUsedThisTurn=false;
+        m_sel=nullptr; m_reinf=nullptr; m_nodeMenu=nullptr;
+        m_extend=0; m_str=DEF_S;
+        m_netActive=false; m_netWaiting=false; m_netGotSeed=false; m_netOppLeft=false;
+        m_netRole = isHost?0:1;
+        m_netColor = isHost?0:1;
+        m_netPlayerIdx = isHost?0:-1;
         for(int i=0;i<4;++i) m_netPlayerColors[i]=-1;
         m_netRoomFull=false; m_netJoined=1;
-        return true;
+        if(isHost) m_netPlayerColors[0]=m_netColor;
+        m_netServer = "Connecting to "+arg+"...";
+        m_netErrMsg.clear();
+
+        m_netConnecting=true; m_netConnHost=isHost; m_netConnArg=arg;
+        m_netConnSock=INVALID_SOCKET; m_netConnErr.clear();
+        m_netConnResult=0;
+        int gen=++m_netConnGen;
+        m_netConnThread = std::thread([this, gen, arg](){
+            SOCKET s=INVALID_SOCKET; std::string err;
+            bool ok = rawConnect(arg, s, err);
+            std::lock_guard<std::mutex> lk(m_netConnMtx);
+            if(gen!=m_netConnGen || !m_netConnecting){   // 已取消/过期
+                if(s!=INVALID_SOCKET) closesocket(s);
+                return;
+            }
+            m_netConnSock = ok?s:INVALID_SOCKET;
+            m_netConnErr = err;
+            m_netConnResult = ok?1:-1;
+        });
+        m_state=State::Playing;                          // 显示 "Connecting..." 等待界面
     }
-    // 开房: 连服务器 → CREATE <n> → 服务器返回 ROOM 房间码
-    bool netHost(const std::string& serverAddr){
-        if(!netConnectServer(serverAddr)) return false;
-        m_netRole=0; m_netColor=0; m_netWaiting=true; m_netPlayerIdx=0;
-        m_netServer="Connecting..."; m_netErrMsg.clear();
-        m_netPlayerColors[0]=m_netColor; m_netJoined=1;
-        char buf[32]; snprintf(buf,sizeof buf,"CREATE %d\n",m_netRoomSize);
-        netSend(buf);
-        m_state=State::Playing;
-        return true;
+    // 每帧轮询: 处理异步连接完成
+    void netConnPoll(){
+        int result=0; bool isHost=false; std::string arg;
+        {
+            std::lock_guard<std::mutex> lk(m_netConnMtx);
+            if(!m_netConnecting) return;
+            result = m_netConnResult;
+            if(result==0) return;
+            isHost = m_netConnHost; arg = m_netConnArg;
+            m_netConnecting=false;
+            if(m_netConnThread.joinable()) m_netConnThread.join();
+            if(result==1){
+                m_netSock=m_netConnSock; m_netBuf.clear();
+                m_netActive=false; m_netGotSeed=false; m_netOppLeft=false;
+                for(int i=0;i<4;++i) m_netPlayerColors[i]=-1;
+                m_netRoomFull=false; m_netJoined=1;
+                if(isHost){
+                    m_netPlayerColors[0]=m_netColor;
+                    char buf[32]; snprintf(buf,sizeof buf,"CREATE %d\n",m_netRoomSize);
+                    netSend(buf);
+                } else {
+                    std::string server=arg, room;
+                    size_t sp=arg.rfind(' ');
+                    if(sp!=std::string::npos){ server=arg.substr(0,sp); room=arg.substr(sp+1); }
+                    m_netServer="Joined "+server+" room "+room;
+                    if(room.empty()){ m_netErrMsg="Missing room code"; result=-1; }
+                    else netSend("JOIN "+room+"\n");
+                }
+            }
+        }
+        // 锁外收尾 (UI/状态)
+        if(result==1){
+            m_netWaiting=true;
+            InvalidateRect(m_hwnd,nullptr,FALSE);
+        } else if(result==-1){
+            m_netErrMsg = m_netConnErr;
+            m_state=State::Menu; m_over=false;
+            m_menuPhase=12; m_menuSel = isHost?1:2;
+            m_enterClock.Restart();
+            InvalidateRect(m_hwnd,nullptr,FALSE);
+            std::wstring emsg(m_netErrMsg.begin(), m_netErrMsg.end());
+            std::wstring cap = isHost ? L"Host failed:\n" : L"Join failed:\n";
+            MessageBoxW(m_hwnd, (cap + emsg).c_str(),
+                        L"Network", MB_OK|MB_ICONWARNING);
+        }
     }
-    // 加入: 输入 "服务器地址 房间码" → 连服务器 → JOIN <code>
-    bool netJoin(const std::string& serverAndRoom){
-        std::string server=serverAndRoom, room;
-        size_t sp=serverAndRoom.rfind(' ');
-        if(sp!=std::string::npos){ server=serverAndRoom.substr(0,sp); room=serverAndRoom.substr(sp+1); }
-        if(server.empty()||room.empty()){ m_netErrMsg="Enter: serverAddr roomCode  (e.g. host:8080 1234)"; return false; }
-        if(!netConnectServer(server)) return false;
-        m_netRole=1; m_netColor=1; m_netWaiting=true; m_netPlayerIdx=-1;
-        m_netServer="Joined "+server+" room "+room; m_netErrMsg.clear();
-        m_netJoined=1; m_netPlayerColors[0]=-1;
-        netSend("JOIN "+room+"\n");
-        m_state=State::Playing;
-        return true;
+    // 取消进行中的异步连接
+    void cancelNetConn(){
+        std::lock_guard<std::mutex> lk(m_netConnMtx);
+        if(m_netConnecting){
+            m_netConnecting=false;
+            m_netConnGen++;
+            if(m_netConnThread.joinable()) m_netConnThread.join();   // 最多等 3s
+        }
     }
     void netDisconnect(){
+        cancelNetConn();
         if(m_netSock!=INVALID_SOCKET){ closesocket(m_netSock); m_netSock=INVALID_SOCKET; }
         m_netActive=false; m_netWaiting=false; m_netMyTurn=false; m_netOppLeft=false; m_netRoomFull=false;
     }
@@ -1876,30 +1973,22 @@ private:
                         m_enterClock.Restart();
                         return;
                     }
-                    if(m_menuSel==1){           // 开房: 输入服务器地址 → CREATE <n> 房间
+                    if(m_menuSel==1){           // 开房: 输入服务器地址 → 异步连接并 CREATE <n>
                         std::wstring defAddr = L"127.0.0.1:8080";
                         if(m_settings.vpnEnable && !m_settings.vpnIP.empty())
                             defAddr = std::wstring(m_settings.vpnIP.begin(),m_settings.vpnIP.end())+L":8080";
                         EnableWindow(m_hwnd, FALSE);
                         std::string srv=promptInput(L"Enter room server address (IPv4)", defAddr.c_str());
                         EnableWindow(m_hwnd, TRUE);
-                        if(netHost(srv)) m_state=State::Playing;   // 进入 Waiting, 等 ROOM 码
-                        else MessageBoxW(m_hwnd,(L"Host failed: "+std::wstring(m_netErrMsg.begin(),m_netErrMsg.end())).c_str(),L"Host",MB_OK|MB_ICONWARNING);
-                    }else{                      // 加入: 输入 "服务器地址 房间码" → JOIN
+                        if(!srv.empty()) netHostStart(srv);   // 异步连接, UI 不阻塞
+                    }else{                      // 加入: 输入 "服务器地址 房间码" → 异步连接并 JOIN
                         std::wstring defAddr = L"127.0.0.1:8080 ";
                         if(m_settings.vpnEnable && !m_settings.vpnIP.empty())
                             defAddr = std::wstring(m_settings.vpnIP.begin(),m_settings.vpnIP.end())+L":8080 ";
                         EnableWindow(m_hwnd, FALSE);
                         std::string addr=promptInput(L"Enter: serverAddr roomCode  (e.g. 192.168.1.5:8080 1234)", defAddr.c_str());
                         EnableWindow(m_hwnd, TRUE);
-                        if(!addr.empty()){
-                            if(netJoin(addr)) m_state=State::Playing;
-                            else{
-                                std::wstring emsg(m_netErrMsg.begin(), m_netErrMsg.end());
-                                MessageBoxW(m_hwnd, (L"Failed to join!\n\n"+emsg).c_str(),
-                                            L"Online Battle", MB_OK|MB_ICONWARNING);
-                            }
-                        }
+                        if(!addr.empty()) netJoinStart(addr);
                     }
                 }
                 return;
@@ -2064,9 +2153,9 @@ private:
                 return;
             }
         }
-        // 在线等待/选色 (房间服务器: 1-4 选色, Esc 退出)
-        if(m_state==State::Playing && m_netWaiting){
-            if(vk>='1'&&vk<='4'){
+        // 在线等待/连接中 (房间服务器: 1-4 选色, Esc 退出/取消)
+        if(m_state==State::Playing && (m_netWaiting || m_netConnecting)){
+            if(vk>='1'&&vk<='4' && m_netWaiting){
                 m_netColor=vk-'1';
                 if(m_netSock!=INVALID_SOCKET){
                     char b[24]; snprintf(b,sizeof b,"COLOR %d\n",m_netColor); netSend(b);
@@ -2600,10 +2689,18 @@ private:
         Pen bp(Color(90,200,205,215),2);
         g.DrawRectangle(&bp,1,1,WIN_W-2,WIN_H-2);
 
-        // 在线等待/选色 (房间服务器: 2~4 人)
-        if(m_netWaiting){
+        // 在线连接中 / 等待选色 (房间服务器: 2~4 人)
+        if(m_netConnecting || m_netWaiting){
             float a=0.6f+0.4f*std::sin(GetTickCount64()*0.003f);
             const wchar_t* cn[4]={L"RED",L"BLUE",L"GREEN",L"YELLOW"};
+            if(m_netConnecting){
+                textC(g,L"Connecting to room server...",WIN_W/2.f,WIN_H/2.f-24,
+                      Color(255,(int)(60*a+60),(int)(160*a+60),220),26,true);
+                std::wstring csrv(m_netServer.begin(),m_netServer.end());
+                textC(g,csrv.c_str(),WIN_W/2.f,WIN_H/2.f+14,Color(255,120,120,130),15,false);
+                textC(g,L"Esc: cancel",WIN_W/2.f,WIN_H/2.f+46,Color(255,140,140,148),13);
+                return;
+            }
             std::wstring pcount = L"Players: " + std::to_wstring(m_netRoomSize);
             if(m_netRole==0 && m_netSock==INVALID_SOCKET){
                 textC(g,L"Hosting room - waiting for opponent...",WIN_W/2.f,WIN_H/2.f-64,
@@ -3117,6 +3214,17 @@ private:
     std::vector<ScorePoint> m_scores;
 
     // ===== 在线对战 (房间服务器转发: 2~4 人) =====
+    // 异步连接 (后台线程执行 DNS+connect, UI 不阻塞)
+    std::mutex m_netConnMtx;
+    std::thread m_netConnThread;
+    bool m_netConnecting = false;
+    int  m_netConnGen = 0;       // 连接代数 (取消/新发起时递增)
+    int  m_netConnResult = 0;    // 0=进行中 1=成功 -1=失败
+    bool m_netConnHost = false;  // 本次连接是否为开房
+    std::string m_netConnArg;    // 连接参数 (地址 或 地址+房间码)
+    SOCKET m_netConnSock = INVALID_SOCKET;
+    std::string m_netConnErr;    // 失败原因
+
     SOCKET m_netSock = INVALID_SOCKET;
     SOCKET m_netListen= INVALID_SOCKET;   // 预留: 主机监听 socket
     bool m_netActive = false;        // 在线对局中
