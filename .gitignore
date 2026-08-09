@@ -26,9 +26,6 @@ __pycache__/
 CMakeSettings.json
 out/
 
-# ===== 本地工作区 =====
-.claude/
-
 # 说明:
 # - settings.dat 与 ai_reasoner_*.dat 保留在仓库中(开箱即用默认值)。
 #   它们是运行时可写文件, 游玩/AI学习后会产生本地改动, 属正常现象。
