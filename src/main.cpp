@@ -443,7 +443,7 @@ public:
         if(!RegisterClassExW(&wc)) return false;
         RECT rc{0,0,FULL_W,WIN_H};
         AdjustWindowRectEx(&rc,WS_OVERLAPPEDWINDOW,FALSE,0);
-        m_hwnd=CreateWindowExW(0,L"BTreeBattle",L"Binary Tree Battle V6.3.1",
+        m_hwnd=CreateWindowExW(0,L"BTreeBattle",L"Binary Tree Battle V6.4.0",
             WS_OVERLAPPEDWINDOW|WS_VISIBLE,CW_USEDEFAULT,CW_USEDEFAULT,
             rc.right-rc.left,rc.bottom-rc.top,nullptr,nullptr,hInst,nullptr);
         if(!m_hwnd) return false;
@@ -2689,7 +2689,7 @@ private:
             Color(255,70,80,140),Color(255,180,60,70));
         g.FillRectangle(&grad,0,0,FULL_W,6);
 
-        textC(g,L"Binary Tree Battle V6.3.1",FULL_W/2.f,170,Color(255,25,25,30),40,true);
+        textC(g,L"Binary Tree Battle V6.4.0",FULL_W/2.f,170,Color(255,25,25,30),40,true);
         textC(g,L"ITERATIVE AI  SELF-LEARNING ENGINE",FULL_W/2.f,215,Color(255,120,120,130),15);
 
         // 装饰线
@@ -2918,7 +2918,7 @@ private:
             textC(g,L"Press ENTER to Start",FULL_W/2.f,646,blink,20,true);
         }
         text(g,L"Ctrl+R Restart",FULL_W-150.f,WIN_H-26,Color(255,150,150,150),12);
-        text(g,L"v6.3.1 Win32+GDI+",10,WIN_H-26,Color(255,150,150,150),12);
+        text(g,L"v6.4.0 Win32+GDI+",10,WIN_H-26,Color(255,150,150,150),12);
     }
 
     // ===== 对战渲染 =====

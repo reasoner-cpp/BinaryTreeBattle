@@ -43,7 +43,7 @@ Compile your DLL and copy it into `ai_plugins\`. Guide: `docs/AI_Plugin_Guide.md
 
 ## Docs
 
-- Game manual (Chinese): `docs/二叉树游戏说明v6.3.0.txt`
+- Game manual (Chinese): `docs/二叉树游戏说明v6.4.0.txt`
 - AI plugin guide: `docs/AI_Plugin_Guide.md`
 
 ## License

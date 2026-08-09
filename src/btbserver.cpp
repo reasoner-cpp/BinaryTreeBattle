@@ -1,5 +1,5 @@
 /**
- * btbserver.cpp — Binary Tree Battle 房间转发服务器 (V6.3.0)
+ * btbserver.cpp — Binary Tree Battle 房间转发服务器 (V6.4.0)
  *
  * 客户端主动连服务器（出站，无需开放入站端口）。服务器按"房间码"配对 2~4 个玩家并
  * 在房间内互相转发消息。
