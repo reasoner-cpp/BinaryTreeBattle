@@ -13,6 +13,8 @@ A turn-based tree-building tactics game for Windows. Grow a binary tree from you
 ## Highlights
 
 - Self-learning AI — Alpha-Beta search, forward simulation, learns from replays
+- Node attack enhancement — right-click a node to boost branch damage (1–5, host-configurable rules)
+- Score points are color-coded (1=yellow, 2=orange, 3=red); branches collect any ball their segment passes through
 - AI plugin SDK — write your own AI, drop a DLL into `ai_plugins\`
 - Online PvP for 2 or 4 players (IPv4) through a room relay server — hosting a room only needs a port: the game auto-detects your IPv4 address and auto-starts `btbserver`
 - EasyTier / ZeroTier / Tailscale virtual-network support (auto IPv4 detection + one-click launch)

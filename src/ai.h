@@ -27,6 +27,7 @@ struct Node {
     std::vector<std::unique_ptr<Node>> children;
     int edgeStrength = 1;    // 线段强度: 创建时str决定, 穿越攻击-1, 归零→子节点孤立化
     int level = 1;           // 节点等级(独立): 右键加强1-5, 形状显示, 孤立后每回合-2
+    int attack = 1;          // 节点攻击力: 分支伤害=攻击力 (1..attackMax, 默认1)
     bool removed = false;    // 节点已死 (从场移除) 但仍持有孤立子节点
     bool isolated = false;   // 孤立节点 (连接被切断, 每回合level-2, 可接回)
 };
@@ -102,6 +103,9 @@ public:
     bool saveToFile(const char* path) const;  // 写入 ai.dat (含学习数据)
     void setLookahead(bool b) { m_lookahead = b; }
     bool lookahead() const { return m_lookahead; }
+    // 节点攻击力上限 (由游戏设置传入)
+    void setAttackMax(int v){ m_attackMax = std::max(1, std::min(5, v)); }
+    int attackMax() const { return m_attackMax; }
 
     // ===== 局面动态分析 =====
     struct Situation {
@@ -254,6 +258,8 @@ private:
     float m_lastDistToEn = -1.f;           // 上次落点距敌根距离
     std::mt19937 m_rng{42};
     float noise() { std::uniform_real_distribution<float> d(-2.f, 2.f); return d(m_rng); }
+
+    int m_attackMax = 5;                 // 节点攻击力上限 (由游戏设置传入)
 
     static constexpr float NODE_R = 10, ATK_M = 2, OCCUPY_R = 30;
     static constexpr float MAX_D = 120, EXTRA_D = 40;

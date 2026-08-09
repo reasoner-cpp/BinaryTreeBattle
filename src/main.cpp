@@ -399,7 +399,7 @@ public:
         if(!RegisterClassExW(&wc)) return false;
         RECT rc{0,0,FULL_W,WIN_H};
         AdjustWindowRectEx(&rc,WS_OVERLAPPEDWINDOW,FALSE,0);
-        m_hwnd=CreateWindowExW(0,L"BTreeBattle",L"Binary Tree Battle V6.3.0",
+        m_hwnd=CreateWindowExW(0,L"BTreeBattle",L"Binary Tree Battle V6.3.1",
             WS_OVERLAPPEDWINDOW|WS_VISIBLE,CW_USEDEFAULT,CW_USEDEFAULT,
             rc.right-rc.left,rc.bottom-rc.top,nullptr,nullptr,hInst,nullptr);
         if(!m_hwnd) return false;
@@ -608,12 +608,14 @@ private:
             if(!clash){m_scores.push_back({p,vv});return;}
         }
     }
-    void collectAt(PointF p){
+    // 收集分数球: 分支线段 from→to 经过的球 (距离线段 < COLLECT_R) 都会收集
+    void collectAt(PointF from, PointF to){
         SecureInt& sc=scoreOf(m_turn);
         bool got=false;
-        for(auto&sp:m_scores)if(sp.alive&&len2(p,sp.pos)<COLLECT_R){
-            sp.alive=false; sc+=sp.value; got=true;
-        }
+        for(auto&sp:m_scores)
+            if(sp.alive && ptSegDist(sp.pos, from, to) < COLLECT_R){
+                sp.alive=false; sc+=sp.value; got=true;
+            }
         // 收集后补生 (场上数量动态平衡, 不吃黄点不得分)
         if(got) spawnScore();
     }
@@ -661,7 +663,7 @@ private:
         recordAction(3,n,n->pos,0,0,scBefore,(int)sc,n->team);
         killSubtree(n);   // 整棵子树销毁
     }
-    void processAttack(PointF p1,PointF p2){
+    void processAttack(PointF p1,PointF p2,int dmg){
         std::set<Node*> hitNodes, crossEdges;
         for(auto*n:m_all){
             if(teamEq(n->team,m_turn))continue;
@@ -673,24 +675,28 @@ private:
             for(auto&c:n->children)
                 if(c&&segCross(p1,p2,n->pos,c->pos)) crossEdges.insert(c.get());
         }
-        // 命中节点本体: 削弱该节点连接父边的强度, 归零 → 整棵子树摧毁 (无节点等级)
+        if(dmg<1) dmg=1;
+        // 命中节点本体: 削弱该节点连接父边的强度 (伤害=源节点攻击力), 归零 → 摧毁子树
         for(Node*t:hitNodes){
             if(std::find(m_all.begin(),m_all.end(),t)==m_all.end())continue; // 已被前序击杀销毁
             if(t->removed)continue;
             if(!t->parent){ killSubtree(t); continue; }   // 命中根 → 直接获胜
-            if(--t->edgeStrength<=0) killSubtree(t);
+            t->edgeStrength-=dmg;
+            if(t->edgeStrength<=0) killSubtree(t);
         }
         // 根已被摧毁 → 游戏结束, 子树已销毁, 不再处理边 (防悬空)
         if(!m_rRoot || !m_bRoot) return;
         // 穿越边: 削弱线段强度, 归零 → 整棵子树摧毁
         for(Node*c:crossEdges){
             if(std::find(m_all.begin(),m_all.end(),c)==m_all.end())continue;
-            if(--c->edgeStrength<=0) killSubtree(c);
+            c->edgeStrength-=dmg;
+            if(c->edgeStrength<=0) killSubtree(c);
         }
     }
 
     // 攻击预览 (只检测, 不实际攻击): 新分支 p1→p2 能切断哪些敌方目标
-    AttackPreview previewAttack(PointF p1,PointF p2,const Color& attacker){
+    AttackPreview previewAttack(PointF p1,PointF p2,const Color& attacker,int dmg=1){
+        if(dmg<1) dmg=1;
         AttackPreview r;
         for(auto*n:m_all){
             if(teamEq(n->team,attacker))continue;
@@ -705,7 +711,7 @@ private:
             if(teamEq(n->team,attacker))continue;
             for(auto&c:n->children)
                 if(c&&segCross(p1,p2,n->pos,c->pos)){
-                    if(c->edgeStrength<=1){ r.edgesKilled++; r.edgesToKill.push_back(c.get()); }
+                    if(c->edgeStrength<=dmg){ r.edgesKilled++; r.edgesToKill.push_back(c.get()); }
                     else r.edgesWeakened++;
                 }
         }
@@ -916,24 +922,33 @@ private:
                 for(auto& c:n->children)
                     if(c && segCross(src,tgt,n->pos,c->pos)) crossEdges.insert(c.get());
             }
-            // 命中节点本体: 削弱该节点连接父边的强度, 归零 → 整棵子树摧毁
+            int dmg = (parent->attack>=1)?parent->attack:1;
+            // 命中节点本体: 削弱该节点连接父边的强度 (伤害=源节点攻击力), 归零 → 摧毁
             for(Node* t:hitNodes){
                 if(std::find(m_all.begin(),m_all.end(),t)==m_all.end())continue;
                 if(t->removed)continue;
                 if(!t->parent){ killSubtree(t); continue; }
-                if(--t->edgeStrength<=0) killSubtree(t);
+                t->edgeStrength-=dmg;
+                if(t->edgeStrength<=0) killSubtree(t);
             }
             if(!m_rRoot || !m_bRoot) return;
             // 穿越边: 削弱线段强度, 归零 → 整棵子树摧毁
             for(Node* c:crossEdges){
                 if(std::find(m_all.begin(),m_all.end(),c)==m_all.end())continue;
-                if(--c->edgeStrength<=0) killSubtree(c);
+                c->edgeStrength-=dmg;
+                if(c->edgeStrength<=0) killSubtree(c);
             }
         } else if(ra.type==1){
             // 强化: px,py 是边子节点位置
             for(auto*n:m_all)
                 if(fabs(n->pos.X-ra.px)<1.f && fabs(n->pos.Y-ra.py)<1.f && n->parent){
                     n->edgeStrength=ra.strength; break;
+                }
+        } else if(ra.type==5){
+            // 增强节点攻击力
+            for(auto*n:m_all)
+                if(fabs(n->pos.X-ra.px)<1.f && fabs(n->pos.Y-ra.py)<1.f){
+                    n->attack = ra.strength; break;
                 }
         } else if(ra.type==3){
             // 删除节点 (整棵子树销毁)
@@ -947,7 +962,7 @@ private:
             PointF tgtP{ra.tx,ra.ty};
             bool got=false;
             for(auto&sp:m_scores)
-                if(sp.alive && len2(tgtP,sp.pos)<COLLECT_R){ sp.alive=false; got=true; break; }
+                if(sp.alive && ptSegDist(sp.pos, parent->pos, tgtP)<COLLECT_R){ sp.alive=false; got=true; break; }
             if(got){
                 int v=0;
                 for(auto&sp:m_repScores)
@@ -1023,7 +1038,7 @@ private:
                 case 2:  tyLbl = L"Extra Move"; break;
                 case 3:  tyLbl = L"Delete"; break;
                 case 4:  tyLbl = L"Reconnect"; break;
-                case 5:  tyLbl = L"Upgrade Node"; break;
+                case 5:  tyLbl = L"Enhance Attack"; break;
                 default: tyLbl = L""; break;
             }
             const wchar_t* whoName[4]={L"RED",L"BLUE",L"GREEN",L"YELLOW"};
@@ -1217,6 +1232,7 @@ private:
         saveState();
         if(m_over)return;
         int scVal = scoreOf(team);                       // 解密
+        ai.setAttackMax(m_settings.attackMax);           // 设置节点攻击力上限 (reinforce 前)
         // AI 防守强化: 记录到回放 (每条 type=1, 含积分变化)
         {
             int scPre = scVal;
@@ -1268,9 +1284,9 @@ private:
         Node* raw=nd.get();
         mv.parent->children.push_back(std::move(nd));
         m_all.push_back(raw);
-        collectAt(mv.target);
-        AttackPreview ap=previewAttack(mv.parent->pos,mv.target,team);
-        processAttack(mv.parent->pos,mv.target);
+        collectAt(mv.parent->pos, mv.target);
+        AttackPreview ap=previewAttack(mv.parent->pos,mv.target,team, mv.parent->attack);
+        processAttack(mv.parent->pos,mv.target, mv.parent->attack);
         m_didBranch=true; checkVictory();
         // 记录行动
         recordAction(0, mv.parent, mv.target, mv.strength, mv.extend,
@@ -1459,7 +1475,13 @@ private:
             if(c<0 || c>3 || seen[c]) return;
             seen[c]=true;
         }
-        // 发起开局
+        // 发起开局: 房主公布游戏规则 → 地图 → 颜色表 → 开始
+        char rb[160]; snprintf(rb,sizeof rb,
+            "RULES %d %d %d %d %d %d %d\n",
+            m_settings.extendMax, m_settings.extendCost, m_settings.reinfCost,
+            m_settings.attackMax, m_settings.attackCost,
+            m_settings.maxScorePts, m_settings.initScorePts);
+        netSend(rb);
         char mb[24]; snprintf(mb,sizeof mb,"MAPSIZE %d\n",m_settings.mapIdx); netSend(mb);
         char cm[48]; snprintf(cm,sizeof cm,"COLORMAP %d %d %d %d\n",
             m_netPlayerColors[0],m_netPlayerColors[1],m_netPlayerColors[2],m_netPlayerColors[3]);
@@ -1540,6 +1562,18 @@ private:
             m_netPlayerColors[2]=c2; m_netPlayerColors[3]=c3;
             return;
         }
+        if(msg.rfind("RULES ",0)==0){               // 房主公布的规则
+            int a[7]; sscanf(msg.c_str()+6,"%d %d %d %d %d %d %d",
+                &a[0],&a[1],&a[2],&a[3],&a[4],&a[5],&a[6]);
+            m_settings.extendMax   = std::max(0,std::min(5,a[0]));
+            m_settings.extendCost  = std::max(0,std::min(3,a[1]));
+            m_settings.reinfCost   = std::max(0,std::min(3,a[2]));
+            m_settings.attackMax   = std::max(1,std::min(5,a[3]));
+            m_settings.attackCost  = std::max(0,std::min(3,a[4]));
+            m_settings.maxScorePts = std::max(3,std::min(10,a[5]));
+            m_settings.initScorePts= std::max(2,std::min(5,a[6]));
+            return;
+        }
         if(msg.rfind("MAPSIZE ",0)==0){
             int idx=atoi(msg.c_str()+8);
             if(idx>=0 && idx<=4){ m_settings.mapIdx=idx; applyMapSize(); saveSettings(); }
@@ -1600,6 +1634,19 @@ private:
                 for(auto* nd:m_all)
                     if(teamEq(nd->team,team)&&fabs(nd->pos.X-px)<1.f&&fabs(nd->pos.Y-py)<1.f&&nd->parent){n=nd;break;}
                 if(n) deleteNode(n);
+            } else if(ty==5){                       // 增强节点攻击力
+                Node* n=nullptr;
+                for(auto* nd:m_all)
+                    if(teamEq(nd->team,team)&&fabs(nd->pos.X-px)<1.f&&fabs(nd->pos.Y-py)<1.f){n=nd;break;}
+                if(n && n->attack < m_settings.attackMax){
+                    SecureInt& sc=scoreOf(team);
+                    int cost=m_settings.attackCost;
+                    if(cost==0 || (int)sc>=cost){
+                        sc-=cost;
+                        n->attack = (s>=1 && s<=m_settings.attackMax)? s : n->attack+1;
+                        recordAction(5,n,n->pos,n->attack,0,(int)sc+cost,(int)sc,team);
+                    }
+                }
             }
             return;
         }
@@ -1748,8 +1795,8 @@ private:
                 Node* raw=nd.get();
                 p->children.push_back(std::move(nd));
                 m_all.push_back(raw);
-                AttackPreview ap=previewAttack(p->pos,tgt,m_turn);
-                collectAt(tgt); processAttack(p->pos,tgt);
+                AttackPreview ap=previewAttack(p->pos,tgt,m_turn, p->attack);
+                collectAt(p->pos,tgt); processAttack(p->pos,tgt, p->attack);
                 m_didBranch=true; checkVictory();
                 recordAction(0,p,tgt,mv.strength,mv.extend,scBefore,(int)sc,m_turn);
                 if(!m_replay.empty()){ m_replay.back().nodesKilled=ap.nodesHit; m_replay.back().edgesKilled=ap.edgesKilled; }
@@ -1941,8 +1988,8 @@ private:
             m_sel->children.push_back(std::move(nd));
             m_all.push_back(raw);
             PointF src=m_sel->pos;
-            AttackPreview ap=previewAttack(src,m,m_turn);
-            collectAt(m); processAttack(src,m);
+            AttackPreview ap=previewAttack(src,m,m_turn, m_sel->attack);
+            collectAt(m_sel->pos,m); processAttack(src,m, m_sel->attack);
             m_didBranch=true; checkVictory();
             // 记录行动
             recordAction(0, m_sel, m, m_str, m_extend, scBefore, (int)sc, m_turn);
@@ -2172,19 +2219,23 @@ private:
                     return;
                 }
                 return;
-            }else if(m_menuPhase==11){  // ---- 游戏规则二级菜单 (←/→ 调整数值) ----
+            }else if(m_menuPhase==11){  // ---- 游戏规则二级菜单 (←/→ 调整数值, 房主可在联机前修改) ----
                 if(vk==VK_ESCAPE){ m_menuPhase=8; m_menuSel=2; m_enterClock.Restart(); saveSettings(); return; }
-                if(vk==VK_DOWN){ m_menuSel=(m_menuSel+1)%5; return; }
-                if(vk==VK_UP){   m_menuSel=(m_menuSel+4)%5; return; }
+                if(vk==VK_DOWN){ m_menuSel=(m_menuSel+1)%7; return; }
+                if(vk==VK_UP){   m_menuSel=(m_menuSel+6)%7; return; }
                 if(vk==VK_LEFT||vk==VK_RIGHT){
                     int dir=(vk==VK_RIGHT)?1:-1;
                     int* v = (m_menuSel==0)?&m_settings.extendMax
                            : (m_menuSel==1)?&m_settings.extendCost
                            : (m_menuSel==2)?&m_settings.reinfCost
-                           : (m_menuSel==3)?&m_settings.maxScorePts
+                           : (m_menuSel==3)?&m_settings.attackMax
+                           : (m_menuSel==4)?&m_settings.attackCost
+                           : (m_menuSel==5)?&m_settings.maxScorePts
                            : &m_settings.initScorePts;
-                    int lo = (m_menuSel==0)?0:(m_menuSel==1||m_menuSel==2)?0:3;
-                    int hi = (m_menuSel==0)?5:(m_menuSel==1||m_menuSel==2)?3:(m_menuSel==3)?10:5;
+                    int lo = (m_menuSel==0)?0 : (m_menuSel==1||m_menuSel==2||m_menuSel==4)?0
+                          : (m_menuSel==3)?1 : (m_menuSel==5)?3 : 2;
+                    int hi = (m_menuSel==0)?5 : (m_menuSel==1||m_menuSel==2||m_menuSel==4)?3
+                          : (m_menuSel==3)?5 : (m_menuSel==5)?10 : 5;
                     *v = std::max(lo,std::min(hi,*v+dir));
                     saveSettings();
                     return;
@@ -2274,8 +2325,29 @@ private:
             return;
         }
         if(m_nodeMenu){
-            // 节点操作面板: 2=删除 Esc=取消 (节点加强机制已移除)
+            // 节点操作面板: 1=攻击+1 2=删除 Esc=取消
             if(vk==VK_ESCAPE){m_nodeMenu=nullptr;return;}
+            if(vk=='1'||vk=='A'){
+                Node* n=m_nodeMenu; m_nodeMenu=nullptr;
+                if(n && n->attack < m_settings.attackMax){
+                    SecureInt& sc=scoreOf(m_turn);
+                    int cost=m_settings.attackCost;
+                    if(cost==0 || (int)sc>=cost){
+                        int scBefore=(int)sc;
+                        saveState();
+                        sc-=cost; n->attack++;
+                        recordAction(5, n, n->pos, n->attack, 0, scBefore, (int)sc, m_turn);
+                        if(m_netActive){
+                            char buf[128];
+                            snprintf(buf,sizeof buf,
+                                "MOVE tm=%d ty=5 px=%.1f py=%.1f tx=%.1f ty2=%.1f s=%d e=0\n",
+                                idxOfTeam(m_turn), n->pos.X, n->pos.Y, n->pos.X, n->pos.Y, n->attack);
+                            netSend(buf);
+                        }
+                    }
+                }
+                return;
+            }
             if(vk=='2'||vk=='D'){
                 Node* n=m_nodeMenu; m_nodeMenu=nullptr;
                 if(n&&n->parent){
@@ -2515,7 +2587,7 @@ private:
             Color(255,70,80,140),Color(255,180,60,70));
         g.FillRectangle(&grad,0,0,FULL_W,6);
 
-        textC(g,L"Binary Tree Battle V6.3.0",FULL_W/2.f,170,Color(255,25,25,30),40,true);
+        textC(g,L"Binary Tree Battle V6.3.1",FULL_W/2.f,170,Color(255,25,25,30),40,true);
         textC(g,L"ITERATIVE AI  SELF-LEARNING ENGINE",FULL_W/2.f,215,Color(255,120,120,130),15);
 
         // 装饰线
@@ -2616,24 +2688,27 @@ private:
                 textC(g,s.c_str(),FULL_W/2.f,py,c, sel?18.f:16.f, sel||(i==0&&m_settings.vpnEnable));
             }
             textC(g,L"Enter: edit/toggle    Esc: back",FULL_W/2.f,652,Color(255,150,150,158),13);
-        }else if(m_menuPhase==11){  // ---- 游戏规则二级菜单 (数值) ----
-            textC(g,L"GAME RULES",FULL_W/2.f,392,Color(255,90,110,140),20,true);
+        }else if(m_menuPhase==11){  // ---- 游戏规则二级菜单 (数值; 联机时房主公布) ----
+            textC(g,L"GAME RULES",FULL_W/2.f,390,Color(255,90,110,140),20,true);
             struct{ const wchar_t* name; int* v; } rows[] = {
                 {L"Extend Max Level", &m_settings.extendMax},
                 {L"Extend Cost (pts/level)", &m_settings.extendCost},
                 {L"Reinforce Cost (pts/level)", &m_settings.reinfCost},
+                {L"Attack Max Level", &m_settings.attackMax},
+                {L"Attack Cost (pts/level)", &m_settings.attackCost},
                 {L"Score Point Cap", &m_settings.maxScorePts},
                 {L"Initial Score Points", &m_settings.initScorePts},
             };
-            float py=448;
-            for(int i=0;i<5;++i,py+=40){
+            float py=428;
+            for(int i=0;i<7;++i,py+=34){
                 bool sel=(m_menuSel==i);
                 std::wstring s=rows[i].name;
                 s += L"  :  " + std::to_wstring(*rows[i].v);
                 textC(g,s.c_str(),FULL_W/2.f,py, sel?Color(255,20,20,25):Color(255,110,110,120),
-                      sel?18.f:16.f, sel);
+                      sel?17.f:15.f, sel);
             }
-            textC(g,L"←/→ adjust    Esc: back",FULL_W/2.f,640,Color(255,150,150,158),13);
+            textC(g,L"←/→ adjust    Esc: back    (host publishes online)",FULL_W/2.f,664,
+                  Color(255,150,150,158),12);
         }else if(m_menuPhase==9){   // ---- 分辨率二级菜单 ----
             textC(g,L"MAP SIZE",FULL_W/2.f,392,Color(255,90,110,140),20,true);
             float py=440;
@@ -2741,7 +2816,7 @@ private:
             textC(g,L"Press ENTER to Start",FULL_W/2.f,646,blink,20,true);
         }
         text(g,L"Ctrl+R Restart",FULL_W-150.f,WIN_H-26,Color(255,150,150,150),12);
-        text(g,L"v6.3.0 Win32+GDI+",10,WIN_H-26,Color(255,150,150,150),12);
+        text(g,L"v6.3.1 Win32+GDI+",10,WIN_H-26,Color(255,150,150,150),12);
     }
 
     // ===== 对战渲染 =====
@@ -2825,13 +2900,16 @@ private:
         drawNodes(g);
         drawDrag(g);
         drawHUD(g);
-        // 节点操作面板 (右键节点): 2删除
+        // 节点操作面板 (右键节点): 1=攻击+1 2=删除
         if(m_nodeMenu && !m_nodeMenu->removed){
-            float pw=320,ph=64,px=(WIN_W-pw)*.5f,py=WIN_H-ph-10;
+            float pw=360,ph=92,px=(WIN_W-pw)*.5f,py=WIN_H-ph-10;
             panel(g,px,py,pw,ph,Color(220,35,35,40),CLR_GOLD,1.5f);
-            textC(g,L"Node Menu  (right-click node)",px+pw/2,py+8,Color(255,255,255,255),14,true);
-            textC(g,L"[2] Delete    [Esc] Cancel",
-                  px+pw/2,py+32,Color(255,220,220,220),12);
+            std::wstring ttl=L"Node Menu   (Attack: "+std::to_wstring(m_nodeMenu->attack)+L")";
+            textC(g,ttl.c_str(),px+pw/2,py+8,Color(255,255,255,255),14,true);
+            textC(g,L"[1] Attack +1   [2] Delete   [Esc] Cancel",
+                  px+pw/2,py+36,Color(255,220,220,220),12);
+            textC(g,L"Branch damage = node attack level",
+                  px+pw/2,py+60,Color(255,200,200,210),10);
         }
     }
 
@@ -2988,6 +3066,13 @@ private:
                 Pen pn(CLR_GOLD,2);
                 g.DrawEllipse(&pn,n->pos.X-NODE_R-6,n->pos.Y-NODE_R-6,(NODE_R+6)*2,(NODE_R+6)*2);
             }
+            // 攻击力徽章: 攻击力>1 时在节点右侧画红色小徽章显示攻击等级
+            if(n->attack>1){
+                float bx=n->pos.X+NODE_R+2, by=n->pos.Y-NODE_R+2;
+                float br=NODE_R*0.62f;
+                circle(g,{bx,by},br,Color(230,220,40,40),Color(255,255,255,255),1.2f);
+                textC(g,std::to_wstring(n->attack),bx,by,Color(255,255,255,255),9,true);
+            }
         }
     }
     void drawDrag(Graphics& g){
@@ -3010,7 +3095,7 @@ private:
         if(len2(m_sel->pos,m_prevDragFrom)<0.5f && len2(m,m_prevDragTo)<0.5f){
             ap=m_cachedPreview;
         }else{
-            ap=previewAttack(m_sel->pos,m,m_turn);
+            ap=previewAttack(m_sel->pos,m,m_turn, m_sel->attack);
             m_prevDragFrom=m_sel->pos; m_prevDragTo=m; m_cachedPreview=ap;
         }
         float pulse=0.5f+0.5f*std::sin(GetTickCount64()*0.008);
@@ -3040,14 +3125,22 @@ private:
         }
     }
     void drawScorePts(Graphics& g){
+        // 分数球颜色: 1分=黄 2分=橙 3分=红
+        static const Color spFill[4]={
+            CLR_GOLD, Color(255,255,215,0), Color(255,255,140,0), Color(255,235,60,50) };
+        static const Color spGlow[4]={
+            Color(80,255,215,0), Color(80,255,215,0), Color(90,255,150,0), Color(90,255,70,50) };
+        static const Color spEdge[4]={
+            CLR_DGOLD, CLR_DGOLD, Color(255,200,90,0), Color(255,180,40,40) };
         // 脉动
         float phase=0.5f+0.5f*std::sin(GetTickCount64()*0.004);
         for(auto&s:m_scores){
             if(!s.alive)continue;
+            int vi = (s.value>=1&&s.value<=3)?s.value:1;
             float pr=SP_R+3+phase*2;
-            SolidBrush glow(Color(80,255,215,0));
+            SolidBrush glow(spGlow[vi]);
             g.FillEllipse(&glow,s.pos.X-pr,s.pos.Y-pr,pr*2,pr*2);
-            circle(g,s.pos,SP_R,CLR_GOLD,CLR_DGOLD,1.5f);
+            circle(g,s.pos,SP_R,spFill[vi],spEdge[vi],1.5f);
             std::wstring v=std::to_wstring(s.value);
             textC(g,v,s.pos.X,s.pos.Y-2,Color(255,30,30,30),12,true);
         }
@@ -3218,6 +3311,16 @@ private:
                  12, WIN_H-22, m_snapEnabled?Color(255,0,140,60):Color(255,160,160,165),
                  12, m_snapEnabled);
         }
+        // 规则公布 (联机时由房主设定并广播; 本地显示当前设置)
+        {
+            std::wstring rt = L"Rules: Extend x" + std::to_wstring(m_settings.extendCost)
+                + L"/" + std::to_wstring(m_settings.extendMax)
+                + L"  Reinforce x" + std::to_wstring(m_settings.reinfCost)
+                + L"  Attack x" + std::to_wstring(m_settings.attackCost)
+                + L"/" + std::to_wstring(m_settings.attackMax)
+                + L"  ScorePts " + std::to_wstring(m_settings.maxScorePts);
+            text(g, rt.c_str(), 12, WIN_H-8, Color(255,110,120,135), 11, false);
+        }
     }
     void drawOverlay(Graphics& g){
         float el=m_restartClock.GetElapsedTime();
@@ -3373,6 +3476,9 @@ private:
         int reinfCost   = 1;          // 每级分支/边强化消耗的积分 (0..3)
         int maxScorePts = 5;          // 场上得分点上限 (3..10)
         int initScorePts= 3;          // 开局得分点数量 (2..5)
+        // V6.3.1: 节点攻击力 (攻击增强)
+        int attackMax = 5;            // 节点攻击力上限 (1..5)
+        int attackCost= 1;            // 每提升 1 级攻击力消耗的积分 (0..3)
         // V6.3.0: 虚拟组网 (EasyTier 等) 设置
         bool   vpnEnable = false;     // 启用虚拟网卡联机
         std::string vpnName;          // EasyTier 网络名
@@ -3406,6 +3512,8 @@ private:
                     else if(!strcmp(k,"reinf_cost")) m_settings.reinfCost = atoi(s);
                     else if(!strcmp(k,"max_score_pts")) m_settings.maxScorePts = atoi(s);
                     else if(!strcmp(k,"init_score_pts")) m_settings.initScorePts = atoi(s);
+                    else if(!strcmp(k,"attack_max"))  m_settings.attackMax = atoi(s);
+                    else if(!strcmp(k,"attack_cost")) m_settings.attackCost = atoi(s);
                     else if(!strcmp(k,"vpn_enable")) m_settings.vpnEnable = atoi(s)!=0;
                     else if(!strcmp(k,"vpn_name"))   m_settings.vpnName = s;
                     else if(!strcmp(k,"vpn_secret")) m_settings.vpnSecret = s;
@@ -3436,6 +3544,8 @@ private:
         fprintf(f,"reinf_cost=%d\n",m_settings.reinfCost);
         fprintf(f,"max_score_pts=%d\n",m_settings.maxScorePts);
         fprintf(f,"init_score_pts=%d\n",m_settings.initScorePts);
+        fprintf(f,"attack_max=%d\n",m_settings.attackMax);
+        fprintf(f,"attack_cost=%d\n",m_settings.attackCost);
         fprintf(f,"vpn_enable=%d\n",m_settings.vpnEnable?1:0);
         fprintf(f,"vpn_name=%s\n",m_settings.vpnName.c_str());
         fprintf(f,"vpn_secret=%s\n",m_settings.vpnSecret.c_str());

@@ -96,9 +96,9 @@ struct SimState {
         return c;
     }
 
-    void simCollect(SimState& st, PointF p, int& sc) {
+    void simCollect(SimState& st, PointF p1, PointF p2, int& sc) {
         for (auto& sp : st.scores)
-            if (sp.alive && len2(p, sp.pos) < 18.f) { sp.alive = false; sc += sp.value; }
+            if (sp.alive && ptSegDist(sp.pos, p1, p2) < 18.f) { sp.alive = false; sc += sp.value; }
     }
     void simKill(SimState& st, Node* node) {
         if (!node) return;
@@ -119,7 +119,8 @@ struct SimState {
             if (node == st.enRoot) st.enRoot = nullptr;
         }
     }
-    void simAttack(SimState& st, PointF p1, PointF p2, const Color& attacker) {
+    void simAttack(SimState& st, PointF p1, PointF p2, const Color& attacker, int dmg) {
+        if(dmg<1) dmg=1;
         std::set<Node*> hits;
         for (auto* n : st.all) {
             if (sameColor(n->team, attacker)) continue;
@@ -136,7 +137,7 @@ struct SimState {
         std::set<Node*> toKill;
         for (Node* t : hits) {
             if (!t->parent) toKill.insert(t);
-            else if (--t->edgeStrength <= 0) toKill.insert(t);
+            else if ((t->edgeStrength -= dmg) <= 0) toKill.insert(t);
         }
         for (Node* t : toKill) {
             if (std::find(st.all.begin(), st.all.end(), t) == st.all.end()) continue;
@@ -153,8 +154,8 @@ struct SimState {
         Node* raw = nd.get();
         parent->children.push_back(std::move(nd));
         st.all.push_back(raw);
-        simCollect(st, tgt, sc);
-        simAttack(st, parent->pos, tgt, team);
+        simCollect(st, parent->pos, tgt, sc);
+        simAttack(st, parent->pos, tgt, team, parent->attack);
         return true;
     }
 
@@ -702,9 +703,9 @@ float AI::scoreTarget(Node* parent, PointF tgt, int str, int ext,
     }
 
     bool collected = false;
-    float collectValue = 0.f;   // 目标附近黄点总值
+    float collectValue = 0.f;   // 分支线段附近黄点总值 (整段经过即收集)
     for (auto& sp : scores)
-        if (sp.alive && len2(tgt, sp.pos) < 18.f) {
+        if (sp.alive && ptSegDist(sp.pos, src, tgt) < 18.f) {
             collected = true;
             collectValue += sp.value;
             s += sp.value * ((spendMult > 3.f) ? m_cfg.collectLow : m_cfg.collect) * dynCol;
@@ -716,6 +717,7 @@ float AI::scoreTarget(Node* parent, PointF tgt, int str, int ext,
 
     int nodesHit = 0, edgesHit = 0, edgesDead = 0, hubValue = 0;
     bool hitRoot = false;
+    int atk = (parent->attack>=1)?parent->attack:1;      // 源节点攻击力
     for (auto* n : nodes) {
         if (sameColor(n->team, myTeam)) continue;
         if ((n->pos.X == src.X && n->pos.Y == src.Y) ||
@@ -733,12 +735,12 @@ float AI::scoreTarget(Node* parent, PointF tgt, int str, int ext,
         for (auto& c : n->children)
             if (c && segCross(src, tgt, n->pos, c->pos)) {
                 edgesHit++;
-                if (c->edgeStrength <= 1) edgesDead++;
+                if (c->edgeStrength <= atk) edgesDead++;     // 攻击力越高, 能击碎的边越多
             }
     }
 
-    s += nodesHit * m_cfg.nodeHit * dynAtk + hubValue * m_cfg.hubFactor * dynAtk;
-    s += edgesDead * m_cfg.edgeKill * dynAtk;
+    s += nodesHit * m_cfg.nodeHit * atk * dynAtk + hubValue * m_cfg.hubFactor * atk * dynAtk;
+    s += edgesDead * m_cfg.edgeKill * atk * dynAtk;
     s += (edgesHit - edgesDead) * m_cfg.edgeHit * dynAtk;
 
     // 从根节点开新枝: 若无战果则惩罚 (鼓励从已有前线节点深化推进)
@@ -1125,6 +1127,24 @@ void AI::reinforce(std::vector<Node*>& nodes, int& myScore, int enScore, const C
         int up = std::min(cd.maxUp, std::min(2, budget));
         if (up > 0 && up <= myScore) { myScore -= up; budget -= up; cd.child->edgeStrength += up; count++; }
     }
+    // ===== 节点攻击力增强: 预算富余时, 给最靠近敌根的可扩展节点提升攻击 =====
+    if (budget > 0 && myScore > 0 && m_sit.myNodes >= 4) {
+        Node* enRoot = nullptr;
+        for (auto* nn : nodes)
+            if (nn->parent == nullptr && !sameColor(nn->team, myTeam)) { enRoot = nn; break; }
+        Node* bestNode = nullptr;
+        float bestD = 1e18f;
+        for (auto* n : nodes) {
+            if (!sameColor(n->team, myTeam) || n->children.size() >= 2) continue;
+            if (n->attack >= m_attackMax) continue;
+            float d = enRoot ? len2(n->pos, enRoot->pos) : 1e18f;
+            if (d < bestD) { bestD = d; bestNode = n; }
+        }
+        if (bestNode) {
+            int up = std::min(m_attackMax - bestNode->attack, budget);
+            if (up > 0 && up <= myScore) { myScore -= up; budget -= up; bestNode->attack += up; }
+        }
+    }
 }
 
 // ===================== 前向模拟 (围棋式 lookahead) =====================
@@ -1162,7 +1182,7 @@ float AI::quickScore(Node* parent, PointF tgt, int str, int ext,
     bool collected = false;
     float collectValue = 0.f;
     for (auto& sp : scores)
-        if (sp.alive && len2(tgt, sp.pos) < 18.f) {
+        if (sp.alive && ptSegDist(sp.pos, src, tgt) < 18.f) {
             collected = true;
             collectValue += sp.value;
             s += sp.value * m_cfg.collect + sp.value * 5.f;  // 现值奖励
@@ -1172,6 +1192,7 @@ float AI::quickScore(Node* parent, PointF tgt, int str, int ext,
         s -= ((float)ext - collectValue) * 20.f;
     int nodesHit = 0, edgesHit = 0, edgesDead = 0, hubValue = 0;
     bool hitRoot = false;
+    int atk = (parent->attack>=1)?parent->attack:1;
     for (auto* n : nodes) {
         if (sameColor(n->team, myTeam)) continue;
         if ((n->pos.X == src.X && n->pos.Y == src.Y) ||
@@ -1188,11 +1209,11 @@ float AI::quickScore(Node* parent, PointF tgt, int str, int ext,
         for (auto& c : n->children)
             if (c && segCross(src, tgt, n->pos, c->pos)) {
                 edgesHit++;
-                if (c->edgeStrength <= 1) edgesDead++;
+                if (c->edgeStrength <= atk) edgesDead++;
             }
     }
-    s += nodesHit * m_cfg.nodeHit + hubValue * m_cfg.hubFactor
-       + edgesDead * m_cfg.edgeKill + (edgesHit - edgesDead) * m_cfg.edgeHit;
+    s += nodesHit * m_cfg.nodeHit * atk + hubValue * m_cfg.hubFactor * atk
+       + edgesDead * m_cfg.edgeKill * atk + (edgesHit - edgesDead) * m_cfg.edgeHit;
     // 扩展无战果重罚 (与 scoreTarget 一致; collected 已在上面定义)
     if (ext > 0 && nodesHit == 0 && edgesHit == 0 && !collected)
         s -= ext * 18.f;

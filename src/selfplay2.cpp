@@ -89,11 +89,11 @@ struct Game {
             if (!clash) { scores.push_back({p, vv}); return; }
         }
     }
-    void collectAt(PointF p, const Color& team) {
+    void collectAt(PointF p1, PointF p2, const Color& team) {
         int& sc = sameColor(team, CLR_RED) ? rScore : bScore;
         bool got = false;
         for (auto& sp : scores)
-            if (sp.alive && len2(p, sp.pos) < 18.f) {
+            if (sp.alive && ptSegDist(sp.pos, p1, p2) < 18.f) {
                 sp.alive = false; sc += sp.value;
                 if (sameColor(team, CLR_RED)) redCollected++; else blueCollected++;
                 got = true;
@@ -122,7 +122,8 @@ struct Game {
             if (node == bRoot.get()) bRoot.reset();
         }
     }
-    void processAttack(PointF p1, PointF p2, const Color& attacker) {
+    void processAttack(PointF p1, PointF p2, const Color& attacker, int dmg) {
+        if(dmg<1) dmg=1;
         std::set<Node*> hitNodes, crossEdges;
         for (auto* n : all) {
             if (sameColor(n->team, attacker)) continue;
@@ -134,15 +135,15 @@ struct Game {
             for (auto& c : n->children)
                 if (c && segCross(p1, p2, n->pos, c->pos)) crossEdges.insert(c.get());
         }
-        // 命中节点本体: 削弱该节点连接父边的强度, 归零 → 整棵子树摧毁
+        // 命中节点本体: 削弱该节点连接父边的强度 (伤害=源节点攻击力), 归零 → 摧毁
         std::set<Node*> toKill;
         for (Node* t : hitNodes) {
             if (!t->parent) toKill.insert(t);
-            else if (--t->edgeStrength <= 0) toKill.insert(t);
+            else if ((t->edgeStrength -= dmg) <= 0) toKill.insert(t);
         }
         // 穿越边: 削弱线段强度, 归零 → 整棵子树摧毁
         for (Node* c : crossEdges) {
-            if (--c->edgeStrength <= 0) toKill.insert(c);
+            if ((c->edgeStrength -= dmg) <= 0) toKill.insert(c);
         }
         for (Node* t : toKill) killSubtree(t);
     }
@@ -168,9 +169,9 @@ struct Game {
         Node* raw = nd.get();
         mv.parent->children.push_back(std::move(nd));
         all.push_back(raw);
-        collectAt(mv.target, team);
+        collectAt(mv.parent->pos, mv.target, team);
         int before = (int)all.size();
-        processAttack(mv.parent->pos, mv.target, team);
+        processAttack(mv.parent->pos, mv.target, team, mv.parent->attack);
         hit = before - (int)all.size();
         if (sameColor(team, CLR_RED)) redKills += hit; else blueKills += hit;
         checkVictory();
