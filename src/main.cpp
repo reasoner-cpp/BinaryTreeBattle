@@ -517,7 +517,8 @@ private:
 
     void frame(float dt){
         (void)dt;
-        // 联机: 处理异步连接完成 + 每帧轮询网络消息
+        // 联机: 房主轮询(接受/转发) + 处理异步连接 + 客户端收包
+        if(m_state==State::Playing) netHostPoll();
         if(m_state==State::Playing) netConnPoll();
         if(m_state==State::Playing) netPoll();
         // AI 回合: 迭代思考驱动 (思考中实时展示选点动画)
@@ -1353,7 +1354,15 @@ private:
     }
 
     // ===== 联机对战 (在线 PvP) =====
+    // 房主: 广播给所有已连接客户端
+    void netSendAllClients(const std::string& msg){
+        for(int i=1;i<4;++i)
+            if(m_netClientSock[i]!=INVALID_SOCKET)
+                send(m_netClientSock[i], msg.c_str(), (int)msg.size(), 0);
+    }
+    // 发送消息: 房主→广播给客户端; 客户端→发给房主
     void netSend(const std::string& msg){
+        if(m_netHostMode){ netSendAllClients(msg); return; }
         if(m_netSock==INVALID_SOCKET) return;
         send(m_netSock, msg.c_str(), (int)msg.size(), 0);
     }
@@ -1367,129 +1376,101 @@ private:
             if(host.empty()) host="127.0.0.1";
         }
     }
-    // ===== 联机对战: 异步连接 (后台线程执行 DNS+connect, UI 不阻塞) =====
-    // 发起开房: 输入端口(或完整地址) → 自动本机托管/检测对外 IPv4
-    void netHostStart(const std::string& input){
-        m_netAutoLaunch=false;
-        std::string target = input;
-        // 兼容: 输入完整 "IP:port" 时按远程服务器处理
-        if(input.find(':') != std::string::npos){
-            target = input;
-        } else {
-            // 只输入端口 → 本机托管: 连接 127.0.0.1, 自动启动 btbserver, 展示检测到的对外地址
-            int port = 8080;
-            if(!input.empty()) port = atoi(input.c_str());
-            if(port<=0 || port>65535) port = 8080;
-            m_netAutoLaunch=true;
-            m_netHostPort = port;
-            ensureFirewallRule(port);                  // 确保防火墙放行, 否则别人连不进来
-            m_netLocalIPs = localIPv4s();
-            std::string share;
-            if(m_settings.vpnEnable && !m_settings.vpnIP.empty()) share = m_settings.vpnIP;   // 虚拟地址优先
-            else share = pickShareIP(m_netLocalIPs);   // 私网 IP 优先
-            m_netShareAddr = share + ":" + std::to_string(port);
-            target = "127.0.0.1:" + std::to_string(port);
-        }
-        netConnBegin(true, target);
-        if(!m_netAutoLaunch) m_netShareAddr = input;   // 远程托管: 展示输入的地址
-        m_netServer = m_netShareAddr;                  // 等待界面: "Share this address: <addr>"
-    }
-    // 发起加入: 连接服务器, 完成后自动发送 JOIN 并进入等待
-    void netJoinStart(const std::string& serverAndRoom){
-        netConnBegin(false, serverAndRoom);
-    }
-    // 发起一次异步连接 (isHost: 开房 / 加入)
-    void netConnBegin(bool isHost, const std::string& arg){
-        std::lock_guard<std::mutex> lk(m_netConnMtx);
-        if(m_netConnecting) return;                    // 已有连接进行中
-        // 重置陈旧的对局/AI 状态, 防止残留状态引发崩溃
-        m_aiMode=false; m_bothAI=false;
-        m_aiThinking=false; m_thinkingAI=nullptr;
-        m_over=false; m_didBranch=false; m_xUsedThisTurn=false;
-        m_sel=nullptr; m_reinf=nullptr; m_nodeMenu=nullptr;
-        m_extend=0; m_str=DEF_S;
-        m_netActive=false; m_netWaiting=false; m_netGotSeed=false; m_netOppLeft=false;
-        m_netRole = isHost?0:1;
-        m_netColor = isHost?0:1;
-        m_netPlayerIdx = isHost?0:-1;
-        for(int i=0;i<4;++i) m_netPlayerColors[i]=-1;
-        m_netRoomFull=false; m_netJoined=1;
-        if(isHost) m_netPlayerColors[0]=m_netColor;
-        m_netServer = isHost ? m_netShareAddr : ("Connecting to "+arg+"...");
-        m_netErrMsg.clear();
 
-        m_netConnecting=true; m_netConnHost=isHost; m_netConnArg=arg;
+    // ===== 联机对战 (房主即服务器, 客户端直连房主) — 参照 btb-py =====
+    void resetNetState(){
+        m_aiMode=false; m_bothAI=false; m_aiThinking=false; m_thinkingAI=nullptr;
+        m_over=false; m_didBranch=false; m_xUsedThisTurn=false;
+        m_sel=nullptr; m_reinf=nullptr; m_nodeMenu=nullptr; m_extend=0; m_str=DEF_S;
+        m_netActive=false; m_netWaiting=false; m_netGotSeed=false; m_netOppLeft=false;
+        m_netMyTurn=false; m_netRoomFull=false; m_netJoined=1;
+        for(int i=0;i<4;++i) m_netPlayerColors[i]=-1;
+    }
+    // 房主开房: 直接 bind 端口监听, 等待玩家直连 (不再需要 btbserver / 房间码)
+    void netHostStart(const std::string& input){
+        resetNetState();
+        m_netHostMode=true; m_netRole=0; m_netColor=0; m_netPlayerIdx=0;
+        int port = 8080;
+        size_t colon=input.rfind(':');
+        if(colon!=std::string::npos){ port=atoi(input.substr(colon+1).c_str()); }
+        else if(!input.empty()){ port=atoi(input.c_str()); }
+        if(port<=0 || port>65535) port=8080;
+        m_netHostPort=port;
+        ensureFirewallRule(port);                                  // 放行防火墙
+        m_netLocalIPs=localIPv4s();
+        std::string share = (m_settings.vpnEnable && !m_settings.vpnIP.empty())
+                          ? m_settings.vpnIP : pickShareIP(m_netLocalIPs);
+        m_netShareAddr = share + ":" + std::to_string(port);
+        m_netServer = m_netShareAddr;
+        // 绑定监听
+        m_netListen = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if(m_netListen==INVALID_SOCKET){ m_netErrMsg="socket failed"; m_netHostMode=false; return; }
+        int reuse=1; setsockopt(m_netListen,SOL_SOCKET,SO_REUSEADDR,(const char*)&reuse,sizeof reuse);
+        sockaddr_in a{}; a.sin_family=AF_INET; a.sin_addr.s_addr=INADDR_ANY; a.sin_port=htons((u_short)port);
+        if(bind(m_netListen,(sockaddr*)&a,sizeof a)!=0 || listen(m_netListen,SOMAXCONN)!=0){
+            closesocket(m_netListen); m_netListen=INVALID_SOCKET; m_netHostMode=false;
+            std::wstring m = L"Cannot listen on port "+std::to_wstring(port)+L".\nIt may be in use (another host/game running).";
+            MessageBoxW(m_hwnd,m.c_str(),L"Host",MB_OK|MB_ICONWARNING);
+            return;
+        }
+        u_long mode=1; ioctlsocket(m_netListen,FIONBIO,&mode);
+        for(int i=0;i<4;++i){ m_netClientSock[i]=INVALID_SOCKET; m_netClientBuf[i].clear(); }
+        m_netPlayerColors[0]=m_netColor; m_netJoined=1;
+        m_netWaiting=true; m_netActive=true;
+        m_state=State::Playing;
+    }
+    // 发起加入: 直连房主 IP:port (无房间码)
+    void netJoinStart(const std::string& hostPort){
+        resetNetState();
+        m_netHostMode=false; m_netRole=1; m_netColor=1; m_netPlayerIdx=-1;
+        m_netServer="Connecting to "+hostPort+"...";
+        netConnBegin(false, hostPort);
+    }
+    // 异步连接 (仅加入方使用; 房主不再需要连接服务器)
+    void netConnBegin(bool /*isHost*/, const std::string& arg){
+        std::lock_guard<std::mutex> lk(m_netConnMtx);
+        if(m_netConnecting) return;
+        m_netConnecting=true; m_netConnHost=false; m_netConnArg=arg;
         m_netConnSock=INVALID_SOCKET; m_netConnErr.clear();
         m_netConnResult=0;
         int gen=++m_netConnGen;
         m_netConnThread = std::thread([this, gen, arg](){
             SOCKET s=INVALID_SOCKET; std::string err;
             bool ok = rawConnect(arg, s, err);
-            // 本机托管: 任何连接失败都启动本机 btbserver 并多次重试 (等待其就绪)
-            if(!ok && m_netAutoLaunch){
-                if(s!=INVALID_SOCKET){ closesocket(s); s=INVALID_SOCKET; }
-                launchLocalServer(m_netHostPort);
-                for(int i=0;i<12 && !ok;++i){     // 最多重试约 6 秒
-                    Sleep(500);
-                    ok = rawConnect(arg, s, err);
-                }
-            }
             std::lock_guard<std::mutex> lk(m_netConnMtx);
-            if(gen!=m_netConnGen || !m_netConnecting){   // 已取消/过期
-                if(s!=INVALID_SOCKET) closesocket(s);
-                return;
-            }
+            if(gen!=m_netConnGen || !m_netConnecting){ if(s!=INVALID_SOCKET) closesocket(s); return; }
             m_netConnSock = ok?s:INVALID_SOCKET;
             m_netConnErr = err;
             m_netConnResult = ok?1:-1;
         });
-        m_state=State::Playing;                          // 显示 "Connecting..." 等待界面
+        m_state=State::Playing;
     }
-    // 每帧轮询: 处理异步连接完成
+    // 每帧轮询: 处理加入方异步连接完成
     void netConnPoll(){
-        int result=0; bool isHost=false; std::string arg;
+        int result=0; std::string arg;
         {
             std::lock_guard<std::mutex> lk(m_netConnMtx);
             if(!m_netConnecting) return;
             result = m_netConnResult;
             if(result==0) return;
-            isHost = m_netConnHost; arg = m_netConnArg;
+            arg = m_netConnArg;
             m_netConnecting=false;
             if(m_netConnThread.joinable()) m_netConnThread.join();
             if(result==1){
                 m_netSock=m_netConnSock; m_netBuf.clear();
-                m_netActive=false; m_netGotSeed=false; m_netOppLeft=false;
-                for(int i=0;i<4;++i) m_netPlayerColors[i]=-1;
-                m_netRoomFull=false; m_netJoined=1;
-                if(isHost){
-                    m_netPlayerColors[0]=m_netColor;
-                    char buf[32]; snprintf(buf,sizeof buf,"CREATE %d\n",m_netRoomSize);
-                    netSend(buf);
-                } else {
-                    std::string server=arg, room;
-                    size_t sp=arg.rfind(' ');
-                    if(sp!=std::string::npos){ server=arg.substr(0,sp); room=arg.substr(sp+1); }
-                    m_netServer="Joined "+server+" room "+room;
-                    if(room.empty()){ m_netErrMsg="Missing room code"; result=-1; }
-                    else netSend("JOIN "+room+"\n");
-                }
+                m_netActive=true; m_netGotSeed=false; m_netOppLeft=false;
+                m_netServer="Connected to "+arg+" - pick color";
             }
         }
-        // 锁外收尾 (UI/状态)
         if(result==1){
-            m_netWaiting=true;
-            InvalidateRect(m_hwnd,nullptr,FALSE);
+            m_netWaiting=true; InvalidateRect(m_hwnd,nullptr,FALSE);
         } else if(result==-1){
-            m_netErrMsg = m_netConnErr;
-            m_state=State::Menu; m_over=false;
-            m_menuPhase=12; m_menuSel = isHost?1:2;
-            m_enterClock.Restart();
-            InvalidateRect(m_hwnd,nullptr,FALSE);
-            std::wstring emsg(m_netErrMsg.begin(), m_netErrMsg.end());
-            std::wstring cap = isHost ? L"Host failed:\n" : L"Join failed:\n";
-            std::wstring hint = L"\n\nTip: use the host's reachable IP (LAN/VPN) and make sure the port is allowed in Windows Firewall (host must allow it).";
-            MessageBoxW(m_hwnd, (cap + emsg + hint).c_str(),
-                        L"Network", MB_OK|MB_ICONWARNING);
+            m_netErrMsg=m_netConnErr;
+            m_state=State::Menu; m_over=false; m_menuPhase=12; m_menuSel=2;
+            m_enterClock.Restart(); InvalidateRect(m_hwnd,nullptr,FALSE);
+            std::wstring emsg(m_netErrMsg.begin(),m_netErrMsg.end());
+            std::wstring hint=L"\n\nTip: use the host's reachable IP (LAN/VPN) and make sure the port is allowed in Windows Firewall.";
+            MessageBoxW(m_hwnd,(L"Join failed:\n"+emsg+hint).c_str(),L"Network",MB_OK|MB_ICONWARNING);
         }
     }
     // 取消进行中的异步连接
@@ -1504,6 +1485,12 @@ private:
     void netDisconnect(){
         cancelNetConn();
         if(m_netSock!=INVALID_SOCKET){ closesocket(m_netSock); m_netSock=INVALID_SOCKET; }
+        if(m_netHostMode){
+            for(int i=1;i<4;++i)
+                if(m_netClientSock[i]!=INVALID_SOCKET){ closesocket(m_netClientSock[i]); m_netClientSock[i]=INVALID_SOCKET; }
+            if(m_netListen!=INVALID_SOCKET){ closesocket(m_netListen); m_netListen=INVALID_SOCKET; }
+            m_netHostMode=false;
+        }
         m_netActive=false; m_netWaiting=false; m_netMyTurn=false; m_netOppLeft=false; m_netRoomFull=false;
     }
     void netOppLeft(){ m_netOppLeft=true; netDisconnect(); }
@@ -1572,44 +1559,71 @@ private:
             m_netGotSeed=false;
         }
     }
-    // 处理一行网络消息 (服务器转发, 带 "PEER " 前缀)
-    void netHandleLine(const std::string& line){
-        bool fromPeer=false;
-        std::string msg=line;
-        if(msg.rfind("PEER ",0)==0){ fromPeer=true; msg=msg.substr(5); }
-        if(msg.rfind("BYE",0)==0){ netOppLeft(); return; }
-        if(msg.rfind("ROOM ",0)==0){               // 开房成功
-            m_netRoomCode = msg.substr(5);
-            if(m_netRole==0 && !m_netShareAddr.empty())
-                m_netServer = m_netShareAddr + "  " + m_netRoomCode;   // 供他人直接复制加入
-            else
-                m_netServer = "Room code: " + m_netRoomCode;
-            return;
-        }
-        if(msg.rfind("JOINED ",0)==0){
-            int idx=atoi(msg.c_str()+7);
-            if(fromPeer){                       // 其他玩家加入了房间
-                if(m_netRole==0 && idx>=1 && idx<4) m_netJoined |= (1<<idx);
-            } else {                            // 服务器告诉我的编号
-                m_netPlayerIdx=idx;
+    // 应用一条 MOVE 消息到本地 (客户端接收广播 / 房主应用客户端动作)
+    void applyMoveMessage(const std::string& msg){
+        int tm=0,ty=0,s=1,e=0; float px=0,py=0,tx=0,ty2=0;
+        sscanf(msg.c_str()+5, "tm=%d ty=%d px=%f py=%f tx=%f ty2=%f s=%d e=%d", &tm,&ty,&px,&py,&tx,&ty2,&s,&e);
+        Color team=CLR_TEAMS[tm%4];
+        if(ty==0){
+            Node* parent=nullptr;
+            for(auto*n:m_all)
+                if(teamEq(n->team,team)&&fabs(n->pos.X-px)<1.f&&fabs(n->pos.Y-py)<1.f){parent=n;break;}
+            if(!parent) return;
+            AI::Move mv; mv.parent=parent; mv.target={tx,ty2}; mv.strength=s; mv.extend=e; mv.score=1.f;
+            executeMove(team,mv,false);
+        } else if(ty==1){
+            Node* child=nullptr;
+            for(auto*n:m_all)
+                if(teamEq(n->team,team)&&fabs(n->pos.X-tx)<1.f&&fabs(n->pos.Y-ty2)<1.f&&n->parent){child=n;break;}
+            if(child && child->edgeStrength<MAX_S){
+                SecureInt& sc=scoreOf(team);
+                int cost=(s-child->edgeStrength)*m_settings.reinfCost;
+                if(cost>0 && (int)sc>=cost){ sc-=cost; child->edgeStrength=s; recordAction(1,child,child->pos,s,0,(int)sc+cost,(int)sc,team); }
             }
+        } else if(ty==3){
+            Node* n=nullptr;
+            for(auto* nd:m_all)
+                if(teamEq(nd->team,team)&&fabs(nd->pos.X-px)<1.f&&fabs(nd->pos.Y-py)<1.f&&nd->parent){n=nd;break;}
+            if(n) deleteNode(n);
+        } else if(ty==5){                       // 增强节点攻击力
+            Node* n=nullptr;
+            for(auto* nd:m_all)
+                if(teamEq(nd->team,team)&&fabs(nd->pos.X-px)<1.f&&fabs(nd->pos.Y-py)<1.f){n=nd;break;}
+            if(n && n->attack < m_settings.attackMax){
+                SecureInt& sc=scoreOf(team);
+                int cost=m_settings.attackCost;
+                if(cost==0 || (int)sc>=cost){
+                    sc-=cost;
+                    n->attack = (s>=1 && s<=m_settings.attackMax)? s : n->attack+1;
+                    recordAction(5,n,n->pos,n->attack,0,(int)sc+cost,(int)sc,team);
+                }
+            }
+        }
+    }
+    // 客户端: 处理来自房主的一行消息 (直连协议)
+    void netHandleLine(const std::string& line){
+        std::string msg=line;
+        if(msg.rfind("BYE",0)==0){ netOppLeft(); return; }
+        if(msg.rfind("YOU ",0)==0){                 // 房主告知玩家编号与总人数
+            int idx=0,total=2;
+            sscanf(msg.c_str()+4,"%d %d",&idx,&total);
+            m_netPlayerIdx=idx;
+            m_netRoomSize=(total==4)?4:2;
+            m_netServer="Connected - pick color";
             return;
         }
-        if(msg.rfind("FULL ",0)==0){
-            m_netRoomSize=atoi(msg.c_str()+5);
-            if(m_netRoomSize!=2 && m_netRoomSize!=4) m_netRoomSize=2;
-            m_netRoomFull=true;
-            if(m_netRole==0) hostTryStart();
-            return;
-        }
-        if(msg.rfind("COLOR ",0)==0){           // 服务器已去重, 格式: PEER COLOR <玩家编号> <颜色>
+        if(msg.rfind("COLOR ",0)==0){               // 房主广播选色: COLOR <玩家> <颜色>
             int pidx=0,cidx=0;
             sscanf(msg.c_str()+6,"%d %d",&pidx,&cidx);
             if(pidx>=0 && pidx<4) m_netPlayerColors[pidx]=cidx;
-            if(m_netRole==0){ m_netPlayerColors[0]=m_netColor; hostTryStart(); }
             return;
         }
-        if(msg.rfind("COLORMAP ",0)==0){        // 房主广播的最终颜色表
+        if(msg=="TAKECOLOR"){
+            m_netColor=(m_netColor+1)%4;
+            char b[24]; snprintf(b,sizeof b,"COLOR %d\n",m_netColor); netSend(b);
+            return;
+        }
+        if(msg.rfind("COLORMAP ",0)==0){            // 房主广播最终颜色表
             int c0=0,c1=0,c2=0,c3=0;
             sscanf(msg.c_str()+9,"%d %d %d %d",&c0,&c1,&c2,&c3);
             m_netPlayerColors[0]=c0; m_netPlayerColors[1]=c1;
@@ -1634,12 +1648,6 @@ private:
             return;
         }
         if(msg=="START"){ netStartPeer(); return; }
-        if(msg=="TAKECOLOR"){
-            m_netColor=(m_netColor+1)%4;
-            char b[24]; snprintf(b,sizeof b,"COLOR %d\n",m_netColor); netSend(b);
-            if(m_netRole==0){ m_netPlayerColors[0]=m_netColor; }
-            return;
-        }
         if(msg.rfind("SEED ",0)==0 && !m_netGotSeed){
             unsigned seed=(unsigned)atoi(msg.c_str()+5);
             m_rng.seed(seed);
@@ -1655,7 +1663,7 @@ private:
             m_enterClock.Restart();
             return;
         }
-        if(msg.rfind("EXTRA ",0)==0){           // 某玩家购买了额外行动, 同步扣分
+        if(msg.rfind("EXTRA ",0)==0){               // 某玩家购买额外行动, 同步扣分
             int tm=atoi(msg.c_str()+6);
             if(tm>=0 && tm<4){
                 SecureInt& sc=m_plyScores[tm%4];
@@ -1663,46 +1671,87 @@ private:
             }
             return;
         }
-        if(msg.rfind("MOVE ",0)==0){
-            int tm=0,ty=0,s=1,e=0; float px=0,py=0,tx=0,ty2=0;
-            sscanf(msg.c_str()+5, "tm=%d ty=%d px=%f py=%f tx=%f ty2=%f s=%d e=%d", &tm,&ty,&px,&py,&tx,&ty2,&s,&e);
-            Color team=CLR_TEAMS[tm%4];
-            if(ty==0){
-                Node* parent=nullptr;
-                for(auto*n:m_all)
-                    if(teamEq(n->team,team)&&fabs(n->pos.X-px)<1.f&&fabs(n->pos.Y-py)<1.f){parent=n;break;}
-                if(!parent) return;
-                AI::Move mv; mv.parent=parent; mv.target={tx,ty2}; mv.strength=s; mv.extend=e; mv.score=1.f;
-                executeMove(team,mv,false);
-            } else if(ty==1){
-                Node* child=nullptr;
-                for(auto*n:m_all)
-                    if(teamEq(n->team,team)&&fabs(n->pos.X-tx)<1.f&&fabs(n->pos.Y-ty2)<1.f&&n->parent){child=n;break;}
-                if(child && child->edgeStrength<MAX_S){
-                    SecureInt& sc=scoreOf(team);
-                    int cost=(s-child->edgeStrength)*m_settings.reinfCost;
-                    if(cost>0 && (int)sc>=cost){ sc-=cost; child->edgeStrength=s; recordAction(1,child,child->pos,s,0,(int)sc+cost,(int)sc,team); }
-                }
-            } else if(ty==3){
-                Node* n=nullptr;
-                for(auto* nd:m_all)
-                    if(teamEq(nd->team,team)&&fabs(nd->pos.X-px)<1.f&&fabs(nd->pos.Y-py)<1.f&&nd->parent){n=nd;break;}
-                if(n) deleteNode(n);
-            } else if(ty==5){                       // 增强节点攻击力
-                Node* n=nullptr;
-                for(auto* nd:m_all)
-                    if(teamEq(nd->team,team)&&fabs(nd->pos.X-px)<1.f&&fabs(nd->pos.Y-py)<1.f){n=nd;break;}
-                if(n && n->attack < m_settings.attackMax){
-                    SecureInt& sc=scoreOf(team);
-                    int cost=m_settings.attackCost;
-                    if(cost==0 || (int)sc>=cost){
-                        sc-=cost;
-                        n->attack = (s>=1 && s<=m_settings.attackMax)? s : n->attack+1;
-                        recordAction(5,n,n->pos,n->attack,0,(int)sc+cost,(int)sc,team);
-                    }
-                }
+        if(msg.rfind("MOVE ",0)==0){ applyMoveMessage(msg); return; }
+    }
+    // 房主: 处理客户端一行消息
+    void netHostProcessClient(int fromIdx, std::string& buf){
+        size_t pos;
+        while((pos=buf.find('\n'))!=std::string::npos){
+            std::string line=buf.substr(0,pos); buf.erase(0,pos+1);
+            if(line=="BYE"){
+                if(m_netClientSock[fromIdx]!=INVALID_SOCKET){ closesocket(m_netClientSock[fromIdx]); m_netClientSock[fromIdx]=INVALID_SOCKET; }
+                m_netJoined &= ~(1<<fromIdx);
+                netSendAllClients("BYE\n");
+                netOppLeft();
+                continue;
             }
-            return;
+            if(line.rfind("COLOR ",0)==0){          // 选色去重
+                int c=atoi(line.c_str()+6);
+                bool taken=false;
+                for(int j=0;j<4;++j) if(j!=fromIdx && m_netPlayerColors[j]==c) taken=true;
+                if(c<0||c>3||taken){
+                    if(m_netClientSock[fromIdx]!=INVALID_SOCKET) send(m_netClientSock[fromIdx],"TAKECOLOR\n",10,0);
+                    continue;
+                }
+                m_netPlayerColors[fromIdx]=c;
+                char mb[32]; snprintf(mb,sizeof mb,"COLOR %d %d\n", fromIdx, c);
+                netSendAllClients(mb);
+                hostTryStart();
+                continue;
+            }
+            if(line.rfind("MOVE ",0)==0){           // 应用客户端动作 + 转发其他客户端
+                applyMoveMessage(line);
+                for(int j=1;j<4;++j)
+                    if(j!=fromIdx && m_netClientSock[j]!=INVALID_SOCKET)
+                        send(m_netClientSock[j], line.c_str(), (int)line.size(), 0);
+                continue;
+            }
+            if(line=="ENDTURN"){                    // 房主推进回合, 转发其他客户端
+                advanceTurn(); m_didBranch=false; m_xUsedThisTurn=false;
+                m_netMyTurn = teamEq(m_turn, CLR_TEAMS[m_netColor]);
+                m_enterClock.Restart();
+                for(int j=1;j<4;++j)
+                    if(j!=fromIdx && m_netClientSock[j]!=INVALID_SOCKET)
+                        send(m_netClientSock[j],"ENDTURN\n",8,0);
+                continue;
+            }
+            if(line.rfind("EXTRA ",0)==0){          // 同步额外行动扣分
+                int tm=atoi(line.c_str()+6);
+                if(tm>=0&&tm<4){ SecureInt& sc=m_plyScores[tm%4]; if((int)sc>=EXTRA_COST) sc-=EXTRA_COST; }
+                for(int j=1;j<4;++j)
+                    if(j!=fromIdx && m_netClientSock[j]!=INVALID_SOCKET)
+                        send(m_netClientSock[j], line.c_str(), (int)line.size(), 0);
+                continue;
+            }
+        }
+    }
+    // 房主: 每帧轮询监听 + 各客户端消息
+    void netHostPoll(){
+        if(!m_netHostMode || m_netListen==INVALID_SOCKET) return;
+        for(;;){   // 接受新玩家直连 (仅等待期接受)
+            if(!m_netWaiting) break;
+            SOCKET c = accept(m_netListen,nullptr,nullptr);
+            if(c==INVALID_SOCKET) break;
+            int idx=-1;
+            for(int i=1;i<4;++i) if(m_netClientSock[i]==INVALID_SOCKET){ idx=i; break; }
+            if(idx<0){ closesocket(c); break; }      // 已满
+            m_netClientSock[idx]=c;
+            u_long nm=1; ioctlsocket(c,FIONBIO,&nm);
+            char y[48]; snprintf(y,sizeof y,"YOU %d %d\n", idx, m_netRoomSize);
+            send(c,y,(int)strlen(y),0);
+            m_netJoined |= (1<<idx);
+            if((m_netJoined & ((1<<m_netRoomSize)-1)) == ((1<<m_netRoomSize)-1)) m_netRoomFull=true;
+        }
+        for(int i=1;i<4;++i){   // 轮询客户端消息
+            SOCKET c=m_netClientSock[i];
+            if(c==INVALID_SOCKET) continue;
+            char tmp[2048]; int n=recv(c,tmp,sizeof tmp,0);
+            if(n>0){ m_netClientBuf[i].append(tmp,n); netHostProcessClient(i, m_netClientBuf[i]); }
+            else if(n==0){
+                closesocket(c); m_netClientSock[i]=INVALID_SOCKET;
+                m_netJoined &= ~(1<<i); m_netRoomFull=false;
+                netSendAllClients("BYE\n"); netOppLeft();
+            }
         }
     }
     // 每帧轮询服务器收包
@@ -2142,17 +2191,17 @@ private:
                         m_enterClock.Restart();
                         return;
                     }
-                    if(m_menuSel==1){           // 开房: 输入端口 → 自动本机托管并生成对外 IPv4 地址
+                    if(m_menuSel==1){           // 开房: 输入端口 → 房主直接监听, 生成对外 IPv4 地址
                         EnableWindow(m_hwnd, FALSE);
-                        std::string srv=promptInput(L"Enter room server port (auto IPv4 address)", L"8080");
+                        std::string srv=promptInput(L"Enter port (host listens directly, auto IPv4)", L"8080");
                         EnableWindow(m_hwnd, TRUE);
-                        if(!srv.empty()) netHostStart(srv);   // 异步连接, UI 不阻塞
-                    }else{                      // 加入: 输入 "服务器地址 房间码" → 异步连接并 JOIN
-                        std::wstring defAddr = L"127.0.0.1:8080 ";
+                        if(!srv.empty()) netHostStart(srv);   // 房主直接 bind 监听
+                    }else{                      // 加入: 输入 "房主IP:端口" 直连 (无房间码)
+                        std::wstring defAddr = L"192.168.1.5:8080";
                         if(m_settings.vpnEnable && !m_settings.vpnIP.empty())
-                            defAddr = std::wstring(m_settings.vpnIP.begin(),m_settings.vpnIP.end())+L":8080 ";
+                            defAddr = std::wstring(m_settings.vpnIP.begin(),m_settings.vpnIP.end())+L":8080";
                         EnableWindow(m_hwnd, FALSE);
-                        std::string addr=promptInput(L"Enter: serverAddr roomCode  (e.g. 192.168.1.5:8080 1234)", defAddr.c_str());
+                        std::string addr=promptInput(L"Enter host address (IPv4:port)", defAddr.c_str());
                         EnableWindow(m_hwnd, TRUE);
                         if(!addr.empty()) netJoinStart(addr);
                     }
@@ -2323,15 +2372,14 @@ private:
                 return;
             }
         }
-        // 在线等待/连接中 (房间服务器: 1-4 选色, Esc 退出/取消)
+        // 在线等待/连接中 (房主直连: 1-4 选色, Esc 退出/取消)
         if(m_state==State::Playing && (m_netWaiting || m_netConnecting)){
             if(vk>='1'&&vk<='4' && m_netWaiting){
                 m_netColor=vk-'1';
-                if(m_netSock!=INVALID_SOCKET){
-                    char b[24]; snprintf(b,sizeof b,"COLOR %d\n",m_netColor); netSend(b);
-                    if(m_netPlayerIdx>=0 && m_netPlayerIdx<4) m_netPlayerColors[m_netPlayerIdx]=m_netColor;
-                    if(m_netRole==0) hostTryStart();
-                }
+                int me = (m_netPlayerIdx>=0 && m_netPlayerIdx<4)? m_netPlayerIdx : 0;
+                m_netPlayerColors[me]=m_netColor;
+                char b[24]; snprintf(b,sizeof b,"COLOR %d\n",m_netColor); netSend(b);   // 房主广播/客户端发给房主
+                if(m_netRole==0) hostTryStart();
                 return;
             }
             if(vk==VK_ESCAPE){ netDisconnect(); m_state=State::Menu; return; }
@@ -2812,7 +2860,7 @@ private:
             }
             textC(g,L"Host: enter room-server address, get a room code",FULL_W/2.f,604,
                   Color(255,130,130,140),13);
-            textC(g,L"Join: enter 'serverAddr roomCode'  (e.g. 192.168.1.5:8080 1234)",FULL_W/2.f,622,
+            textC(g,L"Join: enter host IPv4:port (e.g. 192.168.1.5:8080)",FULL_W/2.f,622,
                   Color(255,150,150,158),12);
         }else if(m_menuPhase==1 || m_menuPhase==4 || m_menuPhase==6){
             // ===== AI 配置文件(dat) 列表: 1=vs AI红方, 4=AI Battle红方, 6=AI Battle蓝方 =====
@@ -2897,26 +2945,28 @@ private:
             }
             std::wstring pcount = L"Players: " + std::to_wstring(m_netRoomSize);
             if(m_netRole==0){
-                // 房主: 始终显示对外分享地址 + 房间码 (等其他人加入后自动开始)
-                textC(g,L"Hosting room - waiting for players...",WIN_W/2.f,WIN_H/2.f-72,
-                      Color(255,(int)(60*a+60),(int)(160*a+60),220),24,true);
+                // 房主: 显示直连地址, 等待玩家加入后自动开始
                 std::wstring srv(m_netServer.begin(),m_netServer.end());
-                textC(g,L"Send to others (serverAddr roomCode):",WIN_W/2.f,WIN_H/2.f-56,
+                int joinedCnt=0; for(int i=0;i<4;++i) if(m_netJoined&(1<<i)) joinedCnt++;
+                std::wstring hdr = L"Hosting - waiting for players ("+std::to_wstring(joinedCnt)+L"/"+std::to_wstring(m_netRoomSize)+L")...";
+                textC(g,hdr.c_str(),WIN_W/2.f,WIN_H/2.f-72,
+                      Color(255,(int)(60*a+60),(int)(160*a+60),220),24,true);
+                textC(g,L"Send this to others (Online > Join):",WIN_W/2.f,WIN_H/2.f-50,
                       Color(255,180,200,255),14,false);
-                textC(g,L"  "+srv,WIN_W/2.f,WIN_H/2.f-38,
-                      Color(255,255,215,0),19,true);
+                textC(g,L"  "+srv,WIN_W/2.f,WIN_H/2.f-32,
+                      Color(255,255,215,0),20,true);
                 // 备选地址 (多网卡/虚拟网卡) — 用朋友能连通的那个
                 std::wstring alt=L"Also (use the one your friends can reach): ";
                 for(size_t i=0;i<m_netLocalIPs.size() && i<5;++i){
                     if(i>0) alt+=L"   ";
                     alt += std::wstring(m_netLocalIPs[i].begin(),m_netLocalIPs[i].end()) + L":" + std::to_wstring(m_netHostPort);
                 }
-                textC(g,alt.c_str(),WIN_W/2.f,WIN_H/2.f-16,Color(255,160,170,190),11,false);
-                textC(g,L"Others: Online > Join > paste this",WIN_W/2.f,WIN_H/2.f+2,
-                      Color(255,150,160,180),12,false);
+                textC(g,alt.c_str(),WIN_W/2.f,WIN_H/2.f-10,Color(255,160,170,190),11,false);
                 if(!firewallRuleExists(m_netHostPort))
                     textC(g,L"Note: allow port in Windows Firewall (UAC) so others can connect",
-                          WIN_W/2.f,WIN_H/2.f+18,Color(255,220,160,60),11,false);
+                          WIN_W/2.f,WIN_H/2.f+10,Color(255,220,160,60),11,false);
+                textC(g,L"Auto-start when all players join and pick colors",
+                      WIN_W/2.f,WIN_H/2.f+26,Color(255,150,160,180),11,false);
             }else{
                 textC(g,L"Connected - pick your color   ("+pcount+L")",WIN_W/2.f,WIN_H/2.f-64,
                       Color(255,(int)(60*a+60),(int)(160*a+60),220),26,true);
@@ -3469,8 +3519,11 @@ private:
     std::string m_netShareAddr;          // 对外分享地址 (IP:port)
     std::string m_netRoomCode;           // 房间码
 
-    SOCKET m_netSock = INVALID_SOCKET;
-    SOCKET m_netListen= INVALID_SOCKET;   // 预留: 主机监听 socket
+    SOCKET m_netSock = INVALID_SOCKET;           // 加入方: 到房主的 socket
+    SOCKET m_netListen= INVALID_SOCKET;          // 房主: 监听 socket
+    bool   m_netHostMode = false;                // 是否为房主(直接托管)
+    SOCKET m_netClientSock[4] = {INVALID_SOCKET,INVALID_SOCKET,INVALID_SOCKET,INVALID_SOCKET};  // 房主: 各客户端 socket
+    std::string m_netClientBuf[4];               // 房主: 各客户端收包缓冲
     bool m_netActive = false;        // 在线对局中
     int  m_netRole = 0;              // 0=主机(玩家0, 先手) 1=加入
     int  m_netColor = 0;             // 本机所选颜色索引 (0..3)
