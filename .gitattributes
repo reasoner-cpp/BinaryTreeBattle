@@ -1,0 +1,15 @@
+# 统一换行策略
+* text=auto
+
+# 批处理脚本使用 CRLF（Windows 传统）
+*.bat text eol=crlf
+
+# 文本文件使用 LF（Git 标准）
+*.cpp text eol=lf
+*.h text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.py text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf
+*.dat text eol=lf

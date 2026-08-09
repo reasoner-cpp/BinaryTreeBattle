@@ -1,0 +1,43 @@
+# Binary Tree Battle AI config (auto-generated)
+# 修改这些参数可调整内置 AI 的行为, 保存后重启游戏生效.
+# 本文件同时保存"自动学习"得到的胜方打法特征 ([learned] 段),
+# 游戏启动时会加载, 退出时自动写回.
+[config]
+nodeHit=248.15000
+hubFactor=120.30000
+edgeKill=76.70000
+edgeHit=28.56000
+decisive2=207.66000
+combo=43.81000
+strBonus=26.50000
+advance=3.93000
+collect=76.50000
+collectLow=70.86000
+expand=0.48000
+center=0.18000
+defense=1.95000
+reserveBase=2.48000
+spendOpen=27.32000
+spendMid=9.15000
+spendTight=7.90000
+extraThresh=414.62000
+threatMul=1.46000
+reinfBudget=0.42000
+reinfThreat=22.94000
+sprintDist=275.78000
+sprintBonus=1.84000
+extraSprint=210.82000
+deepPush=420.00000
+hubPreference=1.20000
+riskTaker=1.12000
+[learned]
+m_learnAggro=0.50000
+m_learnDefense=0.50000
+m_learnCollect=0.50000
+m_learnDirX=0.00000
+m_learnDirY=0.00000
+m_learnDepth=0.50000
+m_learnSpend=0.90000
+m_learnPush=0.50000
+m_learnScorePref=1.00000
+games_learned=0

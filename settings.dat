@@ -1,0 +1,12 @@
+map_idx=3
+snap=1
+undo=1
+depth=1
+save_pvp=1
+save_pva=1
+save_ava=1
+extend_max=3
+extend_cost=1
+reinf_cost=1
+max_score_pts=5
+init_score_pts=3

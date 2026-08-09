@@ -1,0 +1,35 @@
+# ===== 构建产物 =====
+/build/
+build*/
+*.obj
+*.o
+*.exe
+*.dll
+*.lib
+*.exp
+*.ilk
+*.pdb
+
+# ===== 运行期生成的对局录像 =====
+*.btb
+*.btbdt
+
+# ===== Python =====
+__pycache__/
+*.pyc
+
+# ===== IDE / 编辑器 =====
+.vscode/
+.idea/
+*.suo
+*.user
+CMakeSettings.json
+out/
+
+# ===== Claude / 本地工作区 =====
+.claude/
+
+# 说明:
+# - settings.dat 与 ai_reasoner_*.dat 保留在仓库中(开箱即用默认值)。
+#   它们是运行时可写文件, 游玩/AI学习后会产生本地改动, 属正常现象。
+# - ai_plugins/ 下的 DLL 为编译产物, 不提交; 保留目录结构用 .gitkeep。
