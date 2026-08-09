@@ -23,7 +23,7 @@ static float dist2(float ax,float ay,float bx,float by){ return std::sqrt(sq(ax-
 extern "C" {
 
 AI_PLUGIN_EXPORT const char* aiPluginName(void){ return "Sample Advance AI"; }
-AI_PLUGIN_EXPORT const char* aiPluginAuthor(void){ return "CherryClaw"; }
+AI_PLUGIN_EXPORT const char* aiPluginAuthor(void){ return "reasoner-cpp"; }
 AI_PLUGIN_EXPORT int aiPluginApiVersion(void){ return AI_PLUGIN_API_VERSION; }
 AI_PLUGIN_EXPORT void aiPluginInit(void){ /* 可选：加载时初始化 */ }
 AI_PLUGIN_EXPORT void aiPluginShutdown(void){ /* 可选：卸载时清理 */ }
