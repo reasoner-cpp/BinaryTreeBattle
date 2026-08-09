@@ -358,6 +358,40 @@ static std::vector<std::string> localIPv4s(){
     return out;
 }
 
+// 选择最适合对外分享的 IPv4: 私网 (10/172.16-31/192.168) 优先, 其次第一个
+static std::string pickShareIP(const std::vector<std::string>& ips){
+    for(auto& ip : ips){
+        unsigned a=0,b=0,c=0,d=0;
+        if(sscanf(ip.c_str(),"%u.%u.%u.%u",&a,&b,&c,&d)==4){
+            if((a==10) || (a==172 && b>=16 && b<=31) || (a==192 && b==168))
+                return ip;
+        }
+    }
+    return ips.empty()? "127.0.0.1" : ips[0];
+}
+
+// 检查 Windows 防火墙是否已放行该端口 (无需管理员)
+static bool firewallRuleExists(int port){
+    wchar_t cmd[512];
+    swprintf(cmd,512,L"netsh advfirewall firewall show rule name=\"BTBServer%d\" >nul 2>&1", port);
+    std::wstring cmdline = L"cmd.exe /c " + std::wstring(cmd);
+    STARTUPINFOW si{}; si.cb=sizeof si; si.dwFlags=STARTF_USESHOWWINDOW; si.wShowWindow=SW_HIDE;
+    PROCESS_INFORMATION pi{};
+    if(!CreateProcessW(nullptr,&cmdline[0],nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,nullptr,&si,&pi)) return false;
+    WaitForSingleObject(pi.hProcess, 8000);
+    DWORD rc=0; GetExitCodeProcess(pi.hProcess,&rc);
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    return rc==0;
+}
+// 确保防火墙放行该端口 (不存在则弹 UAC 添加规则)
+static void ensureFirewallRule(int port){
+    if(firewallRuleExists(port)) return;
+    char cmd[512]; snprintf(cmd,sizeof cmd,
+        "netsh advfirewall firewall add rule name=\"BTBServer%d\" dir=in action=allow protocol=TCP localport=%d profile=any", port, port);
+    wchar_t wcmd[512]; swprintf(wcmd,512,L"%hs",cmd);
+    ShellExecuteW(nullptr,L"runas",L"net.exe",wcmd,nullptr,SW_HIDE);   // 触发 UAC
+}
+
 // 启动与游戏同目录的 btbserver.exe (隐藏窗口)
 static void launchLocalServer(int port){
     wchar_t exe[MAX_PATH];
@@ -1348,11 +1382,11 @@ private:
             if(port<=0 || port>65535) port = 8080;
             m_netAutoLaunch=true;
             m_netHostPort = port;
+            ensureFirewallRule(port);                  // 确保防火墙放行, 否则别人连不进来
             m_netLocalIPs = localIPv4s();
             std::string share;
             if(m_settings.vpnEnable && !m_settings.vpnIP.empty()) share = m_settings.vpnIP;   // 虚拟地址优先
-            else if(!m_netLocalIPs.empty()) share = m_netLocalIPs[0];
-            else share = "127.0.0.1";
+            else share = pickShareIP(m_netLocalIPs);   // 私网 IP 优先
             m_netShareAddr = share + ":" + std::to_string(port);
             target = "127.0.0.1:" + std::to_string(port);
         }
@@ -1453,7 +1487,8 @@ private:
             InvalidateRect(m_hwnd,nullptr,FALSE);
             std::wstring emsg(m_netErrMsg.begin(), m_netErrMsg.end());
             std::wstring cap = isHost ? L"Host failed:\n" : L"Join failed:\n";
-            MessageBoxW(m_hwnd, (cap + emsg).c_str(),
+            std::wstring hint = L"\n\nTip: use the host's reachable IP (LAN/VPN) and make sure the port is allowed in Windows Firewall (host must allow it).";
+            MessageBoxW(m_hwnd, (cap + emsg + hint).c_str(),
                         L"Network", MB_OK|MB_ICONWARNING);
         }
     }
@@ -2866,22 +2901,22 @@ private:
                 textC(g,L"Hosting room - waiting for players...",WIN_W/2.f,WIN_H/2.f-72,
                       Color(255,(int)(60*a+60),(int)(160*a+60),220),24,true);
                 std::wstring srv(m_netServer.begin(),m_netServer.end());
-                textC(g,L"Send to others (serverAddr roomCode):",WIN_W/2.f,WIN_H/2.f-48,
+                textC(g,L"Send to others (serverAddr roomCode):",WIN_W/2.f,WIN_H/2.f-56,
                       Color(255,180,200,255),14,false);
-                textC(g,L"  "+srv,WIN_W/2.f,WIN_H/2.f-30,
-                      Color(255,255,215,0),20,true);
-                textC(g,L"Others: Online > Join > paste this",WIN_W/2.f,WIN_H/2.f-10,
-                      Color(255,150,160,180),12,false);
-                // 备选地址 (多网卡/虚拟网卡)
-                if(m_netLocalIPs.size()>1){
-                    std::wstring alt=L"Also: ";
-                    for(size_t i=1;i<m_netLocalIPs.size() && i<4;++i){
-                        if(i>1) alt+=L"   ";
-                        alt += std::wstring(m_netLocalIPs[i].begin(),m_netLocalIPs[i].end());
-                    }
-                    alt += L":"+std::to_wstring(m_netHostPort);
-                    textC(g,alt.c_str(),WIN_W/2.f,WIN_H/2.f-20,Color(255,150,150,160),12,false);
+                textC(g,L"  "+srv,WIN_W/2.f,WIN_H/2.f-38,
+                      Color(255,255,215,0),19,true);
+                // 备选地址 (多网卡/虚拟网卡) — 用朋友能连通的那个
+                std::wstring alt=L"Also (use the one your friends can reach): ";
+                for(size_t i=0;i<m_netLocalIPs.size() && i<5;++i){
+                    if(i>0) alt+=L"   ";
+                    alt += std::wstring(m_netLocalIPs[i].begin(),m_netLocalIPs[i].end()) + L":" + std::to_wstring(m_netHostPort);
                 }
+                textC(g,alt.c_str(),WIN_W/2.f,WIN_H/2.f-16,Color(255,160,170,190),11,false);
+                textC(g,L"Others: Online > Join > paste this",WIN_W/2.f,WIN_H/2.f+2,
+                      Color(255,150,160,180),12,false);
+                if(!firewallRuleExists(m_netHostPort))
+                    textC(g,L"Note: allow port in Windows Firewall (UAC) so others can connect",
+                          WIN_W/2.f,WIN_H/2.f+18,Color(255,220,160,60),11,false);
             }else{
                 textC(g,L"Connected - pick your color   ("+pcount+L")",WIN_W/2.f,WIN_H/2.f-64,
                       Color(255,(int)(60*a+60),(int)(160*a+60),220),26,true);

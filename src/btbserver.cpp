@@ -124,10 +124,25 @@ static void servePeer(int code, int idx){
     }
 }
 
+// 检查/添加 Windows 防火墙入站放行规则 (规则已存在则不重复弹 UAC)
 static void openFirewallPort(int port){
+    {
+        // 已存在则跳过
+        wchar_t q[512];
+        swprintf(q,512,L"netsh advfirewall firewall show rule name=\"BTBServer%d\" >nul 2>&1", port);
+        std::wstring qc = L"cmd.exe /c " + std::wstring(q);
+        STARTUPINFOW si{}; si.cb=sizeof si; si.dwFlags=STARTF_USESHOWWINDOW; si.wShowWindow=SW_HIDE;
+        PROCESS_INFORMATION pi{};
+        if(CreateProcessW(nullptr,&qc[0],nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,nullptr,&si,&pi)){
+            WaitForSingleObject(pi.hProcess, 8000);
+            DWORD rc=0; GetExitCodeProcess(pi.hProcess,&rc);
+            CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+            if(rc==0) return;
+        }
+    }
     char cmd[512];
     snprintf(cmd, sizeof cmd,
-        "netsh advfirewall firewall add rule name=\"BTBServer%d\" dir=in action=allow protocol=TCP localport=%d", port, port);
+        "netsh advfirewall firewall add rule name=\"BTBServer%d\" dir=in action=allow protocol=TCP localport=%d profile=any", port, port);
     wchar_t wcmd[512]; swprintf(wcmd, 512, L"%hs", cmd);
     ShellExecuteW(nullptr, L"runas", L"net.exe", wcmd, nullptr, SW_HIDE);
 }
