@@ -12,9 +12,6 @@ endif()
 # Win32 + GDI+ 版本 —— 仅依赖 Windows 系统自带库
 add_executable(BinaryTreeBattle WIN32 src/main.cpp src/ai.cpp src/ai_plugin_host.cpp)
 
-# 联机服务器: 运行即开启公网 IPv6 端口 (默认 8080)
-add_executable(btbserver src/btbserver.cpp)
-
 # 自我对弈强度评估器
 add_executable(selfplay2 src/selfplay2.cpp src/ai.cpp)
 
@@ -29,11 +26,9 @@ if(MSVC)
     target_compile_options(BinaryTreeBattle PRIVATE /utf-8)
     target_compile_options(selfplay2 PRIVATE /utf-8)
     target_compile_options(sample_ai PRIVATE /utf-8)
-    target_compile_options(btbserver PRIVATE /utf-8)
 endif()
 
 # Windows 系统自带库 (仅依赖系统自带, 无需第三方)
 # 显式列出便于 MinGW 链接; MSVC 下与源码中的 #pragma comment(lib) 等价, 二者共存无害
-target_link_libraries(BinaryTreeBattle PRIVATE gdiplus ws2_32 shell32 winmm comdlg32 iphlpapi)
+target_link_libraries(BinaryTreeBattle PRIVATE gdiplus winmm)
 target_link_libraries(selfplay2 PRIVATE gdiplus)
-target_link_libraries(btbserver PRIVATE ws2_32)
