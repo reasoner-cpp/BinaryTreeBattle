@@ -30,6 +30,7 @@ struct Node {
     int attack = 1;          // 节点攻击力: 分支伤害=攻击力 (1..attackMax, 默认1)
     bool removed = false;    // 节点已死 (从场移除) 但仍持有孤立子节点
     bool isolated = false;   // 孤立节点 (连接被切断, 每回合level-2, 可接回)
+    int rid = -1;            // 对局内唯一节点 ID (回放精确定位, 根=0红/1蓝)
 };
 
 struct SimState;  // 搜索用模拟局面 (前向声明, 定义在 ai.cpp)
@@ -106,6 +107,17 @@ public:
     // 节点攻击力上限 (由游戏设置传入)
     void setAttackMax(int v){ m_attackMax = std::max(1, std::min(5, v)); }
     int attackMax() const { return m_attackMax; }
+    // 游戏规则 (由主游戏设置传入; 默认扩展/强化/攻击升级各 1 分, 扩展上限 3 级)
+    // 成本模型与主游戏 executeMove 一致, 避免规则非默认时 AI 预算失配 (做出付不起的行动被拒)
+    void setRules(int extendCost, int reinfCost, int attackCost, int extendMax){
+        m_extendCost = std::max(0, std::min(5, extendCost));
+        m_reinfCost = std::max(0, std::min(5, reinfCost));
+        m_attackCost = std::max(0, std::min(5, attackCost));
+        m_extendMax = std::max(0, std::min(5, extendMax));
+    }
+    int extendCost() const { return m_extendCost; }
+    int reinfCost() const { return m_reinfCost; }
+    int attackCost() const { return m_attackCost; }
 
     // ===== 局面动态分析 =====
     struct Situation {
@@ -141,6 +153,9 @@ public:
                                const std::vector<ScorePoint>& scores) const;
     /// 观察玩家一次行动 (0=扩张 1=强化 2=攻击 3=额外行动)
     void observePlayerAction(int type);
+    // ===== 自我对弈进化 (参数突变) =====
+    void seedRandom(unsigned s);      // 重置随机数 (保证每局变异不同)
+    void mutate(float rate);          // 随机突变全部 AIConfig 参数 (±rate 比例), 并夹紧到合理范围
 
     // ===== 迭代思考 (支持选点动画) =====
     /// 开始思考 (初始化状态, 分析局面)
@@ -156,12 +171,6 @@ public:
     const Move& result() const { return m_best; }
     /// 保留已评估结果, 开启新一轮扫描 (思考期持续探索)
     void rethink() { m_iter = 0; m_thinking = true; }
-    /// 当前候选热力图 (思考中实时更新)
-    const std::vector<std::pair<PointF, float>>& heatmap() const { return m_lastCands; }
-    /// 思考进度 0..1
-    float thinkProgress() const {
-        return m_maxIter ? std::min(1.f, (float)m_iter / m_maxIter) : 1.f;
-    }
 
     /// 强化薄弱关键边
     void reinforce(std::vector<Node*>& nodes, int& myScore, int enScore, const Color& myTeam);
@@ -177,7 +186,6 @@ private:
     void evaluateNode(Node* n, const std::vector<Node*>& nodes, Node* myRoot,
                       Node* enemyRoot, int myScore, const std::vector<ScorePoint>& scores,
                       const Color& myTeam);
-    void updateHeatmap();
     void finalizeBest(const std::vector<Node*>& nodes, Node* myRoot, Node* enemyRoot,
                       int myScore, int enScore, const std::vector<ScorePoint>& scores,
                       const Color& myTeam);
@@ -232,7 +240,6 @@ private:
     int m_iter = 0, m_maxIter = 0;
     std::vector<Cand> m_allCands;
     Move m_best;
-    std::vector<std::pair<PointF, float>> m_lastCands;
 
     // 玩家策略学习
     std::vector<int> m_playerHistory;   // 最近玩家行动
@@ -252,7 +259,8 @@ private:
     // 记忆
     PointF m_lastTarget{0, 0};
     std::vector<PointF> m_recentTargets;   // 最近落点历史 (打地鼠记忆: 反复被摧毁的位置不再重建)
-    std::vector<PointF> m_killedTargets;   // 已确认被敌方摧毁的落点 (危险区域, 重罚重建)
+    std::vector<PointF> m_killedTargets;   // 已确认被敌方摧毁的己方节点位置 (危险区域, 重罚重建)
+    std::vector<PointF> m_prevMyNodes;     // 上次思考时的己方节点位置快照 (对比出被摧毁的节点)
     int m_turnsWithoutBranch = 0;
     int m_stallTurns = 0;                  // 连续无推进回合 (僵持冲刺触发)
     float m_lastDistToEn = -1.f;           // 上次落点距敌根距离
@@ -260,8 +268,13 @@ private:
     float noise() { std::uniform_real_distribution<float> d(-2.f, 2.f); return d(m_rng); }
 
     int m_attackMax = 5;                 // 节点攻击力上限 (由游戏设置传入)
+    // 游戏规则成本 (由 setRules 传入, 与主游戏一致)
+    int m_extendCost = 1, m_reinfCost = 1, m_attackCost = 1;
+    int m_extendMax = 3;                 // 最大扩展级数
 
     static constexpr float NODE_R = 10, ATK_M = 2, OCCUPY_R = 30;
     static constexpr float MAX_D = 120, EXTRA_D = 40;
     static constexpr int   MAX_STR = 5, DEF_STR = 1;
+    // 最大分支距离 = 基础距离 + 扩展级数×每级距离 (扩展上限按规则)
+    float maxReach() const { return MAX_D + m_extendMax * EXTRA_D; }
 };

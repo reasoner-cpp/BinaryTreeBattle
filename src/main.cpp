@@ -25,8 +25,6 @@
 #include <gdiplus.h>
 #pragma comment(lib, "gdiplus.lib")
 
-#include "ai_plugin.h"
-#include "ai_plugin_host.h"
 #include <cmath>
 #include <array>
 #include <vector>
@@ -135,19 +133,26 @@ const Color CLR_WBLUE {255,150,180,255};
 
 enum class State { Menu, Playing, GameOver, Replay };
 
-// 对局行动记录 (btbdt 格式)
+// 对局行动记录 (BTBDT3 格式: 节点 ID 精确定位 + 精确攻击结果)
 struct ReplayAction {
     int turn = 0;         // 回合数
     int team = 0;         // 0=红 1=蓝
-    int type = 0;         // 0=创建分支 1=强化 2=额外行动
-    float px = 0, py = 0; // 父节点位置
+    int type = 0;         // 0=创建分支 1=强化 2=额外行动 3=删除 5=增强攻击
+    int pid = -1;         // 父节点 ID (精确定位, 根=0红/1蓝)
+    int nid = -1;         // 新建节点 ID (仅分支动作 type=0)
+    float px = 0, py = 0; // 父节点位置 (冗余, 兼容旧文件/调试)
     float tx = 0, ty = 0; // 目标位置
-    int strength = 1;     // 分支强度
+    int strength = 1;     // 分支强度 / 强化目标值 / 攻击力等级
     int extend = 0;       // 扩展级数
+    int atk = 1;          // 分支动作: 攻击方攻击力 (回放兜底用)
     int scBefore = 0;     // 行动前积分
     int scAfter = 0;      // 行动后积分
-    int nodesKilled = 0;  // 命中敌方节点数
-    int edgesKilled = 0;  // 摧毁敌方边数
+    int nodesKilled = 0;  // 命中敌方节点数 (统计/学习)
+    int edgesKilled = 0;  // 摧毁敌方边数 (统计/学习)
+    // ===== 精确攻击结果 (BTBDT3): 分支动作每次攻击影响的敌方节点 rid → 削后父边强度 =====
+    // 0 表示该节点被摧毁 (整棵子树消失)。回放直接应用, 不再重算几何,
+    // 彻底消除 0.1px 坐标舍入导致的相交判定翻转 (旧文件坐标精度不足曾使回放与现场背离)
+    std::vector<std::pair<int,int>> aff;   // (rid, 削后强度); 0=摧毁
 };
 
 // 回放用得分黄点记录 (btbdt [S] 段: 开局黄点布局)
@@ -181,6 +186,14 @@ struct AttackPreview {
     bool hitRoot = false;  // 是否命中敌根
     std::vector<Node*> hitNodes;     // 命中的敌方节点
     std::vector<Node*> edgesToKill;  // 将被摧毁的边 (子节点)
+};
+
+// 实际攻击结算结果 (BTBDT3 回放精确记录用)
+// 注意: 用 rid 而非 Node* 记录 — 被摧毁的节点在 killSubtree 后被释放, 指针会悬垂
+struct AttackResult {
+    std::vector<std::pair<int,int>> affected;  // (敌方节点 rid, 削后父边强度); 0=摧毁子树
+    int nodesHit = 0;       // 直接命中的敌方节点数
+    int edgesKilled = 0;    // 被摧毁的敌方边数
 };
 
 // Color 比较辅助 (GDI+ Color 无 operator==)
@@ -221,6 +234,200 @@ class Game {
 public:
     static Game& I(){ static Game g; return g; }
 
+    // ===== 无头自检 (--selftest): 不开窗口, 真实 AI 对弈 → 录回放 → 重放比对 =====
+    // 验证: ①回放与现场节点数一致 (尤其蓝方); ②每个分支动作都能找到父节点;
+    //       ③中间跳转再放到底 与 直接放到底 一致。结果写入 selftest_log.txt, 返回 0=通过
+    int runSelfTest(){
+        loadSettings();   // 设置地图尺寸 (无窗口安全)
+        m_suppressAutoSave=true;   // 自测自行保存回放, 抑制 checkVictory 自动保存
+        m_bothAI=true; m_aiMode=false; m_evolveActive=false;
+        m_redDiff=1; m_blueDiff=1;
+        m_settings.aiThinkMs=50;                    // 快思考: 只验证逻辑不验证思考时长
+        m_settings.evolveRounds=20;
+        m_redReasonerLoaded=false; m_blueReasonerLoaded=false;   // 禁止写回 reasoner (不动用户数据)
+        scanReasoners();
+        if(!m_reasoners.empty()){
+            m_aiRed.loadFromFile(reasonerPath(m_redReasoner).c_str());
+            m_aiBlue.loadFromFile(reasonerPath(m_blueReasoner).c_str());
+        }
+        FILE* log=fopen("selftest_log.txt","w");
+        if(!log) return 2;
+        int games=3, pass=0, fail=0;
+        // ===== 成本一致性: 面板显示公式必须与执行扣分公式一致 (修复: 面板曾硬编码 1 分/级) =====
+        {
+            int E=m_settings.extendCost, R=m_settings.reinfCost;
+            int ext=2, str=3, cur=1, tgt=4;
+            int execDrag = ext*E + (str-DEF_S)*R;      // onRelease/executeMove 扣分
+            int panelDrag = ext*E + (str-DEF_S)*R;     // 拖拽面板显示 (3118)
+            int execReinf = (tgt-cur)*R;               // Enter 确认强化扣分 (2302)
+            int panelReinf = (tgt-cur)*R;              // 强化面板显示/高亮 (3096)
+            int allowTgt = (tgt-cur)*R;                // 目标强度允许判断 (2318)
+            int wheelOk = (str+1-DEF_S)*R;             // 滚轮上调判断 (1859)
+            int refundHalf = (tgt-cur)*R/2;            // 删除返还 (699)
+            bool ok = (execDrag==panelDrag) && (execReinf==panelReinf)
+                   && (allowTgt==execReinf) && (wheelOk==(str+1-DEF_S)*R)
+                   && (panelDrag==ext*E+(str-DEF_S)*R);
+            fprintf(log,"COST-CHECK rules E=%d R=%d: drag=%d reinf=%d allow=%d wheel=%d refundHalf=%d %s\n",
+                    E,R,panelDrag,panelReinf,allowTgt,wheelOk,refundHalf,ok?"OK":"MISMATCH");
+            if(!ok) fail++;
+        }
+        for(int gi=0; gi<games; ++gi){
+            initGame();
+            // 直接驱动 AI 回合 (不经 frame 的时钟节流, 确定性快跑)
+            int guard=0;
+            while(!m_over && guard++<1500){
+                if(m_state==State::Playing && !m_over){
+                    if(!m_aiThinking){
+                        if(m_bothAI && !m_didBranch){
+                            Color team=m_turn;
+                            m_diff = teamEq(team,CLR_RED) ? m_redDiff : m_blueDiff;
+                            if(teamEq(team,CLR_RED)) startThink(CLR_RED,m_aiRed);
+                            else startThink(CLR_BLUE,m_aiBlue);
+                        }
+                    } else {
+                        Color team=m_thinkingTeam;
+                        AI& ai=*m_thinkingAI;
+                        bool done = ai.thinkStep(m_all,myRootOf(team),enRootOf(team),
+                                                 (int)scoreOf(team),(int)enScoreOf(team),m_scores,team);
+                        if(done) finishThink();
+                    }
+                }
+            }
+            // 统计现场节点
+            int lRed=0,lBlue=0;
+            for(auto*n:m_all){ if(teamEq(n->team,CLR_RED))lRed++; else if(teamEq(n->team,CLR_BLUE))lBlue++; }
+            // 保存回放 (自己的副本, 不依赖 checkVictory 的自动保存)
+            char tfn[64]; snprintf(tfn,64,"Replays\\selftest_g%d.btb",gi);
+            CreateDirectoryA("Replays",nullptr);
+            std::wstring saved=saveReplayToFile(tfn);
+            // 加载 + 重放到底
+            if(saved.empty() || !loadReplayFile(saved.c_str()) || m_repActs.empty()){
+                fprintf(log,"G%d SAVE/LOAD FAILED\n",gi); fail++; continue;
+            }
+            startReplay();
+            int parentMiss=0;
+            while(m_repIdx<(int)m_repActs.size()){
+                auto& ra=m_repActs[m_repIdx];
+                if(ra.type==0){
+                    Node* p=nodeById(ra.pid);
+                    if(!p && ra.pid<0)
+                        for(auto*n:m_all)
+                            if(fabs(n->pos.X-ra.px)<1.f && fabs(n->pos.Y-ra.py)<1.f){p=n;break;}
+                    if(!p){
+                        parentMiss++;
+                        fprintf(log,"  MISS step=%d team=%d pid=%d nid=%d (tx=%.1f,ty=%.1f) existingRids:",
+                                m_repIdx,ra.team,ra.pid,ra.nid,ra.tx,ra.ty);
+                        for(auto*n:m_all) fprintf(log," %d",n->rid);
+                        fprintf(log,"\n");
+                    }
+                }
+                replayStep();
+            }
+            int rRed=0,rBlue=0;
+            for(auto*n:m_all){ if(teamEq(n->team,CLR_RED))rRed++; else if(teamEq(n->team,CLR_BLUE))rBlue++; }
+            bool ok=(lRed==rRed)&&(lBlue==rBlue)&&(parentMiss==0);
+            std::wstring w=m_winner;
+            fprintf(log,"G%d winner=%ls acts=%d live(R=%d,B=%d) replay(R=%d,B=%d) parentMiss=%d moveRej=%d %s\n",
+                    gi,w.c_str(),(int)m_repActs.size(),lRed,lBlue,rRed,rBlue,parentMiss,m_aiMoveRejected,ok?"PASS":"FAIL");
+            if(ok) pass++; else fail++;
+        }
+        // 跳转一致性: 中间跳转再放到底 = 直接放到底
+        {
+            const int N=(int)m_repActs.size();
+            for(int idx : {0, N/3, N/2, N-1}){
+                startReplay();
+                replayJumpTo(idx);
+                int mR=0,mB=0;
+                for(auto*n:m_all){ if(teamEq(n->team,CLR_RED))mR++; else if(teamEq(n->team,CLR_BLUE))mB++; }
+                while(m_repIdx<(int)m_repActs.size()) replayStep();
+                int eR=0,eB=0;
+                for(auto*n:m_all){ if(teamEq(n->team,CLR_RED))eR++; else if(teamEq(n->team,CLR_BLUE))eB++; }
+                fprintf(log,"JUMP idx=%d mid(R=%d,B=%d) -> end(R=%d,B=%d)\n",idx,mR,mB,eR,eB);
+            }
+        }
+        // 旧文件兼容: 扫描 Replays\*.btb (非 selftest_*) 验证可回放
+        {
+            WIN32_FIND_DATAA fd;
+            HANDLE h=FindFirstFileA("Replays\\*.btb",&fd);
+            if(h!=INVALID_HANDLE_VALUE){
+                do{
+                    if(strstr(fd.cFileName,"selftest_")) continue;
+                    if(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY) continue;
+                    char p[200]; snprintf(p,200,"Replays\\%s",fd.cFileName);
+                    std::wstring wp; int n=MultiByteToWideChar(CP_UTF8,0,p,-1,nullptr,0);
+                    if(n>0){ wp.resize(n-1); MultiByteToWideChar(CP_UTF8,0,p,-1,&wp[0],n); }
+                    if(!loadReplayFile(wp.c_str())){ fprintf(log,"LEGACY %s LOAD-FAIL\n",fd.cFileName); continue; }
+                    startReplay();
+                    int miss=0;
+                    while(m_repIdx<(int)m_repActs.size()){
+                        auto& ra=m_repActs[m_repIdx];
+                        if(ra.type==0){
+                            Node* pp=nodeById(ra.pid);
+                            if(!pp && ra.pid<0)
+                                for(auto*nn:m_all)
+                                    if(fabs(nn->pos.X-ra.px)<1.f && fabs(nn->pos.Y-ra.py)<1.f){pp=nn;break;}
+                            if(!pp) miss++;
+                        }
+                        replayStep();
+                    }
+                    int rr=0,bb=0;
+                    for(auto*n:m_all){ if(teamEq(n->team,CLR_RED))rr++; else if(teamEq(n->team,CLR_BLUE))bb++; }
+                    fprintf(log,"LEGACY %s acts=%d miss=%d replay(R=%d,B=%d) %s\n",
+                            fd.cFileName,(int)m_repActs.size(),miss,rr,bb,miss==0?"OK":"MISS");
+                }while(FindNextFileA(h,&fd));
+                FindClose(h);
+            }
+        }
+        // ===== 困难模式验证 (vs AI 困难: 红方 15 分, 玩家 10 分) =====
+        // 复现对局失败模式: 红方 AI 开局烧分破产/不收集。验证: 红方不再破产 (最低分>0), 且收集次数>0
+        {
+            int hardMin = 999, hardCollect = 0, hardWins = 0;
+            for(int hgi=0; hgi<4; ++hgi){
+                m_redDiff=2;   // 困难模式: initGame 内部按 redDiff==2 给红方 15 分
+                initGame();
+                int guard=0;
+                while(!m_over && guard++<1500){
+                    if(m_state==State::Playing && !m_over){
+                        if(!m_aiThinking){
+                            if(m_bothAI && !m_didBranch){
+                                Color team=m_turn;
+                                m_diff = teamEq(team,CLR_RED) ? m_redDiff : m_blueDiff;
+                                if(teamEq(team,CLR_RED)) startThink(CLR_RED,m_aiRed);
+                                else startThink(CLR_BLUE,m_aiBlue);
+                            }
+                        } else {
+                            Color team=m_thinkingTeam;
+                            AI& ai=*m_thinkingAI;
+                            bool done = ai.thinkStep(m_all,myRootOf(team),enRootOf(team),
+                                                     (int)scoreOf(team),(int)enScoreOf(team),m_scores,team);
+                            if(done) finishThink();
+                        }
+                    }
+                }
+                // 跟踪红方最低分: 从 m_replay 动作里的 b/a 提取红方分数轨迹
+                int rmin = 999;
+                for(auto&ra:m_replay)
+                    if(ra.team==0){ rmin = std::min(rmin, ra.scBefore); rmin = std::min(rmin, ra.scAfter); }
+                hardMin = std::min(hardMin, rmin);
+                if(m_winner==L"Red") hardWins++;
+                // 保存第一局困难对局回放 (供分析 AI 行为)
+                if(hgi==0){
+                    CreateDirectoryA("Replays",nullptr);
+                    saveReplayToFile("Replays\\selftest_hard0.btb");
+                }
+            }
+            fprintf(log,"HARD-RED bonus: minScore(tracked)=%d wins=%d/4 (>=1 = 未破产)\n",hardMin,hardWins);
+        }
+        fprintf(log,"SELFTEST %d/%d PASS\n",pass,pass+fail);
+        fclose(log);
+        // 清理自测生成的临时回放文件 (保留 selftest_log.txt 供查看)
+        for(int gi=0; gi<games; ++gi){
+            char tf[64]; snprintf(tf,64,"Replays\\selftest_g%d.btb",gi);
+            DeleteFileA(tf);
+        }
+        return fail==0?0:1;
+    }
+
     bool init(HINSTANCE hInst){
         m_hInst=hInst;
         // 启动 GDI+
@@ -233,7 +440,7 @@ public:
         loadSettings();       // 读取 settings.dat 并应用地图尺寸 (窗口创建前)
         WNDCLASSEXW wc{};
         wc.cbSize=sizeof wc;
-        wc.style=CS_HREDRAW|CS_VREDRAW;
+        wc.style=CS_HREDRAW|CS_VREDRAW|CS_DBLCLKS;   // CS_DBLCLKS: 需要接收双击消息
         wc.lpfnWndProc=Game::WndProc;
         wc.hInstance=hInst;
         wc.hCursor=LoadCursor(nullptr,IDC_ARROW);
@@ -242,7 +449,7 @@ public:
         if(!RegisterClassExW(&wc)) return false;
         RECT rc{0,0,FULL_W,WIN_H};
         AdjustWindowRectEx(&rc,WS_OVERLAPPEDWINDOW,FALSE,0);
-        m_hwnd=CreateWindowExW(0,L"BTreeBattle",L"Binary Tree Battle V6.5.0",
+        m_hwnd=CreateWindowExW(0,L"BTreeBattle",L"Binary Tree Battle V6.6.0",
             WS_OVERLAPPEDWINDOW|WS_VISIBLE,CW_USEDEFAULT,CW_USEDEFAULT,
             rc.right-rc.left,rc.bottom-rc.top,nullptr,nullptr,hInst,nullptr);
         if(!m_hwnd) return false;
@@ -250,8 +457,6 @@ public:
         // ===== AI Reasoner 配置 (ai_reasoner_XXXX.dat) =====
         // 扫描所有 reasoner 文件; 没有则首次扫描 .btb 学习并创建 0001
         scanReasoners();
-        // ===== 加载 AI 插件 (ai_plugins\*.dll) =====
-        m_plugins = aiPluginLoadAll();
         return true;
     }
 
@@ -266,9 +471,9 @@ public:
                 frame((float)(now-last)/1000.f);
                 last=now;
                 // 仅在需要动画时重绘 (避免无谓的 60fps 全图 GDI+ 重绘):
-                // 菜单脉动/拖拽跟随/AI思考热力图/回放播放/AIvsAI
+                // 菜单脉动/拖拽跟随/回放播放/AIvsAI
                 bool needPaint = (m_state==State::Menu)
-                              || (m_state==State::Playing && (m_aiThinking || m_sel || m_bothAI || m_pluginCandsValid))
+                              || (m_state==State::Playing && (m_sel || m_bothAI))
                               || (m_state==State::Replay)
                               || (m_state==State::GameOver);
                 if(needPaint) InvalidateRect(m_hwnd,nullptr,FALSE);
@@ -290,17 +495,18 @@ private:
         {
             PointF np=toPt({(short)LOWORD(l),(short)HIWORD(l)});
             g.m_mouse=np;
-            // 菜单悬停跟随在 WM_MOUSEMOVE 中即时更新 (WM_PAINT 先于 frame() 处理,
-            // 若放在 frame() 中会导致选中框绘制滞后一帧, 出现鼠标操作延迟)
+            // 菜单: 悬停仅记录"待点击"项 (m_menuHover), 不改变选中项 m_menuSel
             if(g.m_state==State::Menu){
                 int hi=g.menuHitOption(np);
-                if(hi>=0 && hi!=g.m_menuSel) g.m_menuSel=hi;
+                if(hi>=0) g.m_menuHover=hi;
+                else g.m_menuHover=-1;
             }
-            // 悬停即时重绘: 保证节点/边/菜单悬停高亮实时同步
+            // 悬停即时重绘: 保证待点击高亮实时同步
             InvalidateRect(h,nullptr,FALSE);
             return 0;
         }
         case WM_LBUTTONDOWN: g.onPress(g.m_mouse); InvalidateRect(h,nullptr,FALSE); return 0;
+        case WM_LBUTTONDBLCLK: g.onDblClick(g.m_mouse); InvalidateRect(h,nullptr,FALSE); return 0;   // 双击进入
         case WM_LBUTTONUP: g.onRelease(g.m_mouse); InvalidateRect(h,nullptr,FALSE); return 0;
         case WM_RBUTTONDOWN: g.onRPress(g.m_mouse); InvalidateRect(h,nullptr,FALSE); return 0;
         case WM_MOUSEWHEEL: g.onWheel((float)GET_WHEEL_DELTA_WPARAM(w)/120.f); InvalidateRect(h,nullptr,FALSE); return 0;
@@ -310,7 +516,6 @@ private:
         case WM_DESTROY:
             g.saveSettings();          // 保存设置 (地图尺寸/快捷键开关)
             g.saveReasonersOnExit();   // 退出时回写本局用到的 AI Reasoner
-            aiPluginUnloadAll(g.m_plugins);
             PostQuitMessage(0); return 0;
         }
         return DefWindowProcW(h,m,w,l);
@@ -318,8 +523,21 @@ private:
 
     void frame(float dt){
         (void)dt;
+        // ===== AI 自我对弈: 对局结束后自动续局, 直到打满 evolveRounds 局 =====
+        if(m_evolveActive && m_state==State::GameOver){
+            if(m_evolveDone < m_settings.evolveRounds){
+                // 每局结束延迟 1.6s (让玩家看到结果) 后自动开始下一局
+                if(m_restartClock.GetElapsedTime()>1.6f){
+                    initGame();
+                    return;
+                }
+            } else {
+                // 全部局数打完 → 结束自我对弈, 停留结算界面
+                m_evolveActive=false;
+            }
+        }
         // 菜单悬停跟随已移至 WM_MOUSEMOVE 即时更新 (消除选中框延迟)
-        // AI 回合: 迭代思考驱动 (思考中实时展示选点动画)
+        // AI 回合: 迭代思考驱动
         if(m_state==State::Playing&&!m_over){
             bool act=false;
             if(m_aiThinking) act=true;                                   // 思考中必须持续驱动
@@ -327,41 +545,21 @@ private:
             else if(m_aiMode&&teamEq(m_turn,CLR_RED)&&!m_didBranch) act=true;
             if(act){
                 if(!m_aiThinking){
-                    // 当前回合方是否自动化（AI 或插件）
+                    // 当前回合方是否自动化（内置 AI）
                     bool autoSide = m_bothAI || (m_aiMode && teamEq(m_turn,CLR_RED));
                     if(autoSide){
-                        int pidx = teamEq(m_turn,CLR_RED) ? m_redPlugin : m_bluePlugin;
-                        if(pidx>=0 && pidx<(int)m_plugins.size() && m_plugins[pidx].loaded){
-                            // 插件 AI: 每回合先等一小段(显示候选热力图), 再执行
-                            int wt = teamEq(m_turn,CLR_RED) ? 0 : 1;
-                            ULONGLONG now=GetTickCount64();
-                            if(m_pluginWaitTeam != wt){
-                                m_pluginWaitTeam = wt;
-                                m_pluginTurnStart = now;
-                                m_pluginCandsValid = false;   // 新回合需重新拉取
-                            }
-                            if(!m_pluginCandsValid){
-                                populatePluginCands(m_turn);
-                                m_pluginCandsValid = true;
-                            }
-                            if(now - m_pluginTurnStart >= PLUGIN_TURN_MS){
-                                m_pluginWaitTeam = -1;
-                                m_pluginCandsValid = false;
-                                m_pluginCands.clear();
-                                startPluginThink(m_turn);
-                            }
-                        } else {
-                            m_diff = teamEq(m_turn,CLR_RED) ? m_redDiff : m_blueDiff;
-                            if(teamEq(m_turn,CLR_RED)) startThink(CLR_RED,m_aiRed);
-                            else startThink(CLR_BLUE,m_aiBlue); // 内置 AI
-                        }
+                        m_diff = teamEq(m_turn,CLR_RED) ? m_redDiff : m_blueDiff;
+                        if(teamEq(m_turn,CLR_RED)) startThink(CLR_RED,m_aiRed);
+                        else startThink(CLR_BLUE,m_aiBlue); // 内置 AI
                     }
                 } else {
-                    // 每秒5帧驱动思考 (每200ms推进一批), 整个思考期持续探索
+                    // 驱动思考: 节流随思考上限缩放 (m_maxThink/3, 范围 10~200ms),
+                    // 使低至 0.05s 的思考时间设置真正生效 (快速批量对弈)
                     Color team=m_thinkingTeam;
                     AI& ai=*m_thinkingAI;
                     ULONGLONG now=GetTickCount64();
-                    if(now-m_lastThinkTick>=200){
+                    ULONGLONG tick = std::max<ULONGLONG>(10, std::min<ULONGLONG>(200, m_maxThink/3));
+                    if(now-m_lastThinkTick>=tick){
                         m_lastThinkTick=now;
                         bool done = ai.thinking() ? ai.thinkStep(m_all,myRootOf(team),enRootOf(team),
                                                                  scoreOf(team),enScoreOf(team),m_scores,team) : true;
@@ -375,8 +573,6 @@ private:
                         }
                     }
                 }
-                // 每帧刷新选点动画
-                if(m_aiThinking) InvalidateRect(m_hwnd,nullptr,FALSE);
             }
         }
         // 回放播放驱动
@@ -408,19 +604,42 @@ private:
     void initGame(){
         m_all.clear(); m_scores.clear(); m_history.clear();
         m_plyScores[0]=SecureInt(); m_plyScores[1]=SecureInt(); m_plyScores[2]=SecureInt(); m_plyScores[3]=SecureInt();
+        // 非 AI Battle 模式: 确保自我对弈状态复位 (防止普通对局结束后误自动续局)
+        if(!m_bothAI) m_evolveActive=false;
+        // 每局重置死循环计数器 (不跨局累计)
+        for(int i=0;i<4;++i){ m_sameMoveCount[i]=0; m_lastMoveTgt[i]={0.f,0.f}; }
+        m_totalTurns=0;
+        m_aiMoveRejected=0;
+        // 自我对弈续局: 重新加载 reasoner (上一局已把学习结果写回 dat, 下一局用升级后的参数)
+        if(m_evolveActive && m_bothAI){
+            if(m_redReasonerLoaded && m_redReasoner>=0 && m_redReasoner<(int)m_reasoners.size())
+                m_aiRed.loadFromFile(reasonerPath(m_redReasoner).c_str());
+            if(m_blueReasonerLoaded && m_blueReasoner>=0 && m_blueReasoner<(int)m_reasoners.size())
+                m_aiBlue.loadFromFile(reasonerPath(m_blueReasoner).c_str());
+            // ===== 进化: 每局参数随机突变 (探索新策略, 各用不同随机种子) =====
+            {
+                unsigned base = (unsigned)GetTickCount64() ^ (unsigned)m_rng() ^ (unsigned)(m_evolveDone*2654435761u);
+                m_aiRed.seedRandom(base);
+                m_aiBlue.seedRandom(base ^ 0x9E3779B9u);
+                m_aiRed.mutate(0.12f);   // 突变幅度 12%
+                m_aiBlue.mutate(0.12f);
+            }
+        }
         // 取消 4 人对战: 仅支持 2 人 (PvP / vs AI / AI Battle 均为红蓝双方)
         m_players = 2;
+        m_nextRid = 2;   // 节点 ID: 0=红根 1=蓝根
         for(int i=0;i<4;++i) m_roots[i].reset();
         m_roots[0]=std::make_unique<Node>(Node{{80,80},CLR_TEAMS[0]});
+        m_roots[0]->rid=0;
         m_roots[1]=std::make_unique<Node>(Node{{WIN_W-80.f,WIN_H-80.f},CLR_TEAMS[1]});
+        m_roots[1]->rid=1;
         for(int i=0;i<m_players;++i) m_all.push_back(m_roots[i].get());
         m_turn=CLR_TEAMS[0]; m_sel=m_hover=nullptr; m_extend=0; m_str=DEF_S;
         m_reinf=nullptr; m_reinfStr=0; m_nodeMenu=nullptr; m_didBranch=false; m_xUsedThisTurn=false;
-        m_pluginWaitTeam=-1; m_pluginTurnStart=0; m_pluginCandsValid=false; m_pluginCands.clear();
         // 困难难度: 内置 AI(红方)初始 15 分, 其余 10 分
         bool redAuto = m_aiMode || m_bothAI;
         for(int i=0;i<m_players;++i)
-            m_plyScores[i] = (i==0 && redAuto && m_redPlugin==-1 && m_redDiff==2) ? 15 : START_SCORE;
+            m_plyScores[i] = (i==0 && redAuto && m_redDiff==2) ? 15 : START_SCORE;
         m_over=false; m_winner.clear();
         m_replay.clear(); m_replayTurn=0; m_replaySaved=false;
         m_aiThinking=false; m_thinkingAI=nullptr; m_hoverEdge=nullptr;
@@ -494,8 +713,9 @@ private:
         if(!n->parent)return;   // 根不可删
         SecureInt& sc=scoreOf(n->team);
         int refund=0;
+        // 返还按实际强化花费 (每级 reinfCost 分; 此前硬编码 1 分/级)
         std::function<void(Node*)> sum=[&](Node* r){
-            for(auto&c:r->children){refund+=c->edgeStrength-1; sum(c.get());}   // 按边强度返还
+            for(auto&c:r->children){refund+=(c->edgeStrength-1)*m_settings.reinfCost; sum(c.get());}
         };
         sum(n);
         refund/=2;
@@ -504,7 +724,10 @@ private:
         recordAction(3,n,n->pos,0,0,scBefore,(int)sc,n->team);
         killSubtree(n);   // 整棵子树销毁
     }
-    void processAttack(PointF p1,PointF p2,int dmg){
+    // 实际攻击结算: 返回每个受影响敌方节点 (节点/边) 的削后父边强度, 0=摧毁子树
+    AttackResult processAttack(PointF p1,PointF p2,int dmg){
+        AttackResult r;
+        if(dmg<1) dmg=1;
         std::set<Node*> hitNodes, crossEdges;
         for(auto*n:m_all){
             if(teamEq(n->team,m_turn))continue;
@@ -516,23 +739,26 @@ private:
             for(auto&c:n->children)
                 if(c&&segCross(p1,p2,n->pos,c->pos)) crossEdges.insert(c.get());
         }
-        if(dmg<1) dmg=1;
         // 命中节点本体: 削弱该节点连接父边的强度 (伤害=源节点攻击力), 归零 → 摧毁子树
         for(Node*t:hitNodes){
             if(std::find(m_all.begin(),m_all.end(),t)==m_all.end())continue; // 已被前序击杀销毁
             if(t->removed)continue;
-            if(!t->parent){ killSubtree(t); continue; }   // 命中根 → 直接获胜
+            if(!t->parent){ r.affected.push_back({t->rid,0}); killSubtree(t); continue; }   // 命中根 → 直接获胜
             t->edgeStrength-=dmg;
-            if(t->edgeStrength<=0) killSubtree(t);
+            r.nodesHit++;
+            if(t->edgeStrength<=0){ r.affected.push_back({t->rid,0}); killSubtree(t); }
+            else r.affected.push_back({t->rid,t->edgeStrength});
         }
         // 根已被摧毁 → 游戏结束, 子树已销毁, 不再处理边 (防悬空)
-        if(!m_rRoot || !m_bRoot) return;
+        if(!m_rRoot || !m_bRoot) return r;
         // 穿越边: 削弱线段强度, 归零 → 整棵子树摧毁
         for(Node*c:crossEdges){
             if(std::find(m_all.begin(),m_all.end(),c)==m_all.end())continue;
             c->edgeStrength-=dmg;
-            if(c->edgeStrength<=0) killSubtree(c);
+            if(c->edgeStrength<=0){ r.affected.push_back({c->rid,0}); r.edgesKilled++; killSubtree(c); }
+            else r.affected.push_back({c->rid,c->edgeStrength});
         }
+        return r;
     }
 
     // 攻击预览 (只检测, 不实际攻击): 新分支 p1→p2 能切断哪些敌方目标
@@ -566,32 +792,36 @@ private:
 
     // ===== 对局记录 =====
     void recordAction(int type, Node* parent, PointF tgt, int str, int ext,
-                      int scBefore, int scAfter, const Color& team){
+                      int scBefore, int scAfter, const Color& team,
+                      const AttackResult* res=nullptr){
         ReplayAction ra;
         ra.turn=m_replayTurn;
         ra.team=teamEq(team,CLR_RED)?0:1;
         ra.type=type;
-        if(parent){ra.px=parent->pos.X; ra.py=parent->pos.Y;}
+        if(parent){ra.pid=parent->rid; ra.px=parent->pos.X; ra.py=parent->pos.Y;}
         ra.tx=tgt.X; ra.ty=tgt.Y;
         ra.strength=str; ra.extend=ext;
         ra.scBefore=scBefore; ra.scAfter=scAfter;
+        // 分支动作: 新建节点 ID (刚 push 进 parent->children 的最后一个子节点)
+        if(type==0 && parent && !parent->children.empty())
+            ra.nid=parent->children.back()->rid;
+        // 分支动作: 精确记录本次攻击结果 (BTBDT3 核心)
+        if(type==0 && res){
+            ra.atk = (parent && parent->attack>=1) ? parent->attack : 1;
+            ra.aff = res->affected;   // 已存 rid:强度, 不含悬垂指针
+            ra.nodesKilled = res->nodesHit;
+            ra.edgesKilled = res->edgesKilled;
+        }
         m_replay.push_back(ra);
     }
-    // 自动保存对局 (文件名: mode_diff_date_time.btb — mode: pvp/pva/ava, diff: easy/mid/hard)
-    void saveReplay(){
-        CreateDirectoryA("Replays", nullptr);   // 确保 Replays 文件夹存在 (自动保存到 Replays\)
-        time_t t=time(nullptr);
-        struct tm tmv{}; localtime_s(&tmv,&t);
-        const char* modeStr = m_bothAI ? "ava" : (m_aiMode ? "pva" : "pvp");
-        const char* diffStr = (m_diff==0)?"easy":(m_diff==2)?"hard":"mid";
-        if(m_bothAI) diffStr="mid";
-        char fn[180];
-        snprintf(fn,180,"Replays\\%s_%s_%04d%02d%02d_%02d%02d%02d.btb",
-            modeStr,diffStr,tmv.tm_year+1900,tmv.tm_mon+1,tmv.tm_mday,tmv.tm_hour,tmv.tm_min,tmv.tm_sec);
+    // 写入回放文件到指定路径 (BTBDT3: 节点 ID 精确定位 + 精确攻击结果); 返回宽字符路径; 失败返回空串
+    std::wstring saveReplayToFile(const char* fn){
         FILE* f=nullptr;
-        if(fopen_s(&f,fn,"w")!=0||!f) return;
-        fprintf(f,"BTBDT1\n");
+        if(fopen_s(&f,fn,"w")!=0||!f) return std::wstring();
+        fprintf(f,"BTBDT3\n");   // V6.5.0: 节点 ID + 精确攻击结果 (兼容 BTBDT1/BTBDT2 读取)
         fprintf(f,"players=%d\n",m_players);
+        fprintf(f,"map_w=%d\n",WIN_W);
+        fprintf(f,"map_h=%d\n",WIN_H);
         fprintf(f,"red_score=%d\n",(int)m_plyScores[0]);
         fprintf(f,"blue_score=%d\n",(int)m_plyScores[1]);
         if(m_players>=3) fprintf(f,"green_score=%d\n",(int)m_plyScores[2]);
@@ -607,8 +837,8 @@ private:
         for(auto&sp:m_initScores){
             if(!sp.alive) continue;
             fprintf(f,"[S]\n");
-            fprintf(f,"x=%.1f\n",sp.pos.X);
-            fprintf(f,"y=%.1f\n",sp.pos.Y);
+            fprintf(f,"x=%.2f\n",sp.pos.X);
+            fprintf(f,"y=%.2f\n",sp.pos.Y);
             fprintf(f,"v=%d\n",sp.value);
         }
         for(auto& ra:m_replay){
@@ -616,18 +846,45 @@ private:
             fprintf(f,"t=%d\n",ra.turn);
             fprintf(f,"tm=%d\n",ra.team);
             fprintf(f,"ty=%d\n",ra.type);
-            fprintf(f,"px=%.1f\n",ra.px);
-            fprintf(f,"py=%.1f\n",ra.py);
-            fprintf(f,"tx=%.1f\n",ra.tx);
-            fprintf(f,"ty2=%.1f\n",ra.ty);
+            fprintf(f,"pid=%d\n",ra.pid);
+            fprintf(f,"nid=%d\n",ra.nid);
+            fprintf(f,"px=%.2f\n",ra.px);
+            fprintf(f,"py=%.2f\n",ra.py);
+            fprintf(f,"tx=%.2f\n",ra.tx);
+            fprintf(f,"ty2=%.2f\n",ra.ty);
             fprintf(f,"s=%d\n",ra.strength);
             fprintf(f,"e=%d\n",ra.extend);
+            fprintf(f,"atk=%d\n",ra.atk);
             fprintf(f,"b=%d\n",ra.scBefore);
             fprintf(f,"a=%d\n",ra.scAfter);
             fprintf(f,"nk=%d\n",ra.nodesKilled);
             fprintf(f,"ek=%d\n",ra.edgesKilled);
+            // ===== 精确攻击结果 (BTBDT3): 受影响敌方节点 rid → 削后强度 (0=摧毁) =====
+            if(!ra.aff.empty()){
+                fprintf(f,"aff=%d\n",(int)ra.aff.size());
+                int k=0;
+                for(auto&p:ra.aff)
+                    fprintf(f,"a%d=%d:%d\n",k++,p.first,p.second);
+            }
         }
         fclose(f);
+        std::wstring wfn; int n=MultiByteToWideChar(CP_UTF8,0,fn,-1,nullptr,0);
+        if(n>0){ wfn.resize(n-1); MultiByteToWideChar(CP_UTF8,0,fn,-1,&wfn[0],n); }
+        return wfn;
+    }
+    // 自动保存对局 (文件名: mode_diff_date_time.btb — mode: pvp/pva/ava, diff: easy/mid/hard)
+    // 返回保存的完整路径; 失败返回空串 (供 AI 自我对弈学习用)
+    std::wstring saveReplay(){
+        CreateDirectoryA("Replays", nullptr);   // 确保 Replays 文件夹存在 (自动保存到 Replays\)
+        time_t t=time(nullptr);
+        struct tm tmv{}; localtime_s(&tmv,&t);
+        const char* modeStr = m_bothAI ? "ava" : (m_aiMode ? "pva" : "pvp");
+        const char* diffStr = (m_diff==0)?"easy":(m_diff==2)?"hard":"mid";
+        if(m_bothAI) diffStr="mid";
+        char fn[180];
+        snprintf(fn,180,"Replays\\%s_%s_%04d%02d%02d_%02d%02d%02d.btb",
+            modeStr,diffStr,tmv.tm_year+1900,tmv.tm_mon+1,tmv.tm_mday,tmv.tm_hour,tmv.tm_min,tmv.tm_sec);
+        return saveReplayToFile(fn);
     }
 
     // ===== 回放 =====
@@ -638,13 +895,19 @@ private:
         m_repActs.clear();
         m_repScores.clear();
         m_repRs=10; m_repBs=10; m_repGs=10; m_repYs=10; m_repPlayers=2; m_repWinner="red";
+        m_repMapW=0; m_repMapH=0;   // BTBDT3: 记录地图尺寸 (0=旧文件, 沿用当前窗口)
+        m_repUseAff=false;          // BTBDT3: 分支攻击效果精确记录 (空 aff = 无效果, 不重算几何)
         ReplayAction cur; bool inAct=false;
         ReplayScorePt curSp; bool inSp=false;
+        int pendingAff=0;   // BTBDT3: 待读的 aff 条目数
+        // 读取魔数行: BTBDT3 → 用精确攻击结果; BTBDT1/BTBDT2/未知 → 几何回退
+        if(fgets(line,sizeof line,f) && strstr(line,"BTBDT3"))
+            m_repUseAff=true;
         while(fgets(line,sizeof line,f)){
             char key[32]; char val[160];
             if(sscanf_s(line,"%31s",key,sizeof(key))==1 && strcmp(key,"[A]")==0){
                 if(inAct) m_repActs.push_back(cur);
-                cur=ReplayAction(); inAct=true; inSp=false; continue;
+                cur=ReplayAction(); inAct=true; inSp=false; pendingAff=0; continue;
             }
             if(sscanf_s(line,"%31s",key,sizeof(key))==1 && strcmp(key,"[S]")==0){
                 if(inSp) m_repScores.push_back(curSp);
@@ -658,6 +921,8 @@ private:
                     continue;
                 }
                 if(strcmp(key,"players")==0) m_repPlayers=atoi(val);
+                else if(strcmp(key,"map_w")==0) m_repMapW=atoi(val);
+                else if(strcmp(key,"map_h")==0) m_repMapH=atoi(val);
                 else if(strcmp(key,"red_score")==0) m_repRs=atoi(val);
                 else if(strcmp(key,"blue_score")==0) m_repBs=atoi(val);
                 else if(strcmp(key,"green_score")==0) m_repGs=atoi(val);
@@ -666,21 +931,47 @@ private:
                 else if(strcmp(key,"t")==0) cur.turn=atoi(val);
                 else if(strcmp(key,"tm")==0) cur.team=atoi(val);
                 else if(strcmp(key,"ty")==0) cur.type=atoi(val);
+                else if(strcmp(key,"pid")==0) cur.pid=atoi(val);
+                else if(strcmp(key,"nid")==0) cur.nid=atoi(val);
                 else if(strcmp(key,"px")==0) cur.px=(float)atof(val);
                 else if(strcmp(key,"py")==0) cur.py=(float)atof(val);
                 else if(strcmp(key,"tx")==0) cur.tx=(float)atof(val);
                 else if(strcmp(key,"ty2")==0) cur.ty=(float)atof(val);
                 else if(strcmp(key,"s")==0) cur.strength=atoi(val);
                 else if(strcmp(key,"e")==0) cur.extend=atoi(val);
+                else if(strcmp(key,"atk")==0) cur.atk=atoi(val);
                 else if(strcmp(key,"b")==0) cur.scBefore=atoi(val);
                 else if(strcmp(key,"a")==0) cur.scAfter=atoi(val);
                 else if(strcmp(key,"nk")==0) cur.nodesKilled=atoi(val);
                 else if(strcmp(key,"ek")==0) cur.edgesKilled=atoi(val);
+                else if(strcmp(key,"aff")==0) pendingAff=atoi(val);
+                else if(pendingAff>0 && key[0]=='a' && key[1]>='0' && key[1]<='9'){
+                    // aN=rid:str 精确攻击结果条目
+                    int rid=-1, str=-1;
+                    if(sscanf_s(val,"%d:%d",&rid,&str)>=1){
+                        if(str<0) str=1;
+                        cur.aff.push_back({rid,str});
+                        pendingAff--;
+                    }
+                }
             }
         }
         if(inAct) m_repActs.push_back(cur);
         if(inSp) m_repScores.push_back(curSp);
         fclose(f);
+        // 旧文件 (BTBDT1/BTBDT2) 无地图尺寸 → 从坐标推断 (取能容纳全部坐标的最小已知地图)
+        if(m_repMapW==0 && !m_repActs.empty()){
+            float maxX=0.f, maxY=0.f;
+            for(auto&a:m_repActs){
+                maxX=std::max(maxX,a.px); maxX=std::max(maxX,a.tx);
+                maxY=std::max(maxY,a.py); maxY=std::max(maxY,a.ty);
+            }
+            for(int i=0;i<3;++i)
+                if(maxX <= kMapW[i]-10.f && maxY <= kMapH[i]-10.f){
+                    m_repMapW=kMapW[i]; m_repMapH=kMapH[i]; break;
+                }
+            if(m_repMapW==0){ m_repMapW=(int)(maxX+40.f); m_repMapH=(int)(maxY+40.f); }
+        }
         m_repFile=path;
         return !m_repActs.empty();
     }
@@ -809,15 +1100,35 @@ private:
             if(!clash){m_scores.push_back({p,vv,true}); return;}
         }
     }
+    // 退出回放 → 恢复现场地图尺寸
+    void leaveReplay(){
+        if(m_repSaveW>0){
+            WIN_W=m_repSaveW; WIN_H=m_repSaveH; FULL_W=WIN_W+PANEL_W; m_repSaveW=0;
+        }
+        m_state=State::Menu;
+    }
+    // BTBDT3: 若回放记录的地图尺寸与当前不一致, 暂时切换到记录尺寸 (保证根/坐标一致)
+    void replayApplyMapSize(){
+        if(m_repMapW>=320 && m_repMapH>=240){
+            if(m_repSaveW==0){ m_repSaveW=WIN_W; m_repSaveH=WIN_H; }
+            WIN_W=m_repMapW; WIN_H=m_repMapH; FULL_W=WIN_W+PANEL_W;
+        }
+    }
     // 开始回放 (加载初始局面, V6.2.0: 按回放玩家数放根)
     void startReplay(){
+        replayApplyMapSize();
         m_all.clear();
         for(int i=0;i<4;++i) m_roots[i].reset();
         m_players = (m_repPlayers==4) ? 4 : 2;
+        m_nextRid = 2;   // 回放节点 ID 从 2 开始 (0/1 留给根)
         m_roots[0]=std::make_unique<Node>(Node{{80,80},CLR_TEAMS[0]});
+        m_roots[0]->rid=0;
         m_roots[1]=std::make_unique<Node>(Node{{WIN_W-80.f,WIN_H-80.f},CLR_TEAMS[1]});
+        m_roots[1]->rid=1;
         if(m_players>=3) m_roots[2]=std::make_unique<Node>(Node{{WIN_W-80.f,80.f},CLR_TEAMS[2]});
+        if(m_players>=3) m_roots[2]->rid=2;
         if(m_players>=4) m_roots[3]=std::make_unique<Node>(Node{{80.f,WIN_H-80.f},CLR_TEAMS[3]});
+        if(m_players>=4) m_roots[3]->rid=3;
         for(int i=0;i<m_players;++i) m_all.push_back(m_roots[i].get());
         m_plyScores[0]=m_repRs; m_plyScores[1]=m_repBs; m_plyScores[2]=m_repGs; m_plyScores[3]=m_repYs;
         m_repIdx=0; m_repPaused=true; m_repLastTick=GetTickCount64();
@@ -834,67 +1145,92 @@ private:
         m_state=State::Replay;
     }
     // 应用一个回放行动 (含攻击效果: 削弱/摧毁)
+    // V6.5.0: 优先用节点 ID (pid) 精确定位父节点, 不依赖坐标匹配 → 修复节点不显示
+    Node* nodeById(int rid){
+        if(rid<0) return nullptr;
+        for(auto*n:m_all) if(n->rid==rid) return n;
+        return nullptr;
+    }
     void replayStep(){
         if(m_repIdx>=(int)m_repActs.size()) return;
         auto& ra=m_repActs[m_repIdx];
-        Node* parent=nullptr;
-        for(auto*n:m_all)
-            if(fabs(n->pos.X-ra.px)<1.f && fabs(n->pos.Y-ra.py)<1.f){parent=n;break;}
+        Node* parent=nodeById(ra.pid);   // 节点 ID 精确定位
+        // 旧文件 (BTBDT1) 无 pid → 回退坐标匹配
+        if(!parent && ra.pid<0)
+            for(auto*n:m_all)
+                if(fabs(n->pos.X-ra.px)<1.f && fabs(n->pos.Y-ra.py)<1.f){parent=n;break;}
         Color team=CLR_TEAMS[ra.team%4];   // V6.2.0: 4 方
         if(ra.type==0 && parent){
             auto nd=std::make_unique<Node>();
             nd->pos={ra.tx,ra.ty}; nd->team=team; nd->parent=parent;
             nd->edgeStrength=ra.strength;
+            nd->rid = (ra.nid>=0) ? ra.nid : m_nextRid++;
+            if(ra.nid>=0) m_nextRid = std::max(m_nextRid, ra.nid+1);   // 保持单调, 防兜底冲突
             Node* raw=nd.get();
             parent->children.push_back(std::move(nd));
             m_all.push_back(raw);
-            // 攻击效果: 分支穿越敌方节点/边 → 削弱/摧毁 (与真实对局一致)
-            PointF src=parent->pos, tgt={ra.tx,ra.ty};
-            std::set<Node*> hitNodes, crossEdges;
-            for(auto*n:m_all){
-                if(teamEq(n->team,team)) continue;
-                if(ptEq(n->pos,src)||ptEq(n->pos,tgt)) continue;
-                if(ptSegDist(n->pos,src,tgt)<NODE_R+ATK_M) hitNodes.insert(n);
-            }
-            for(auto*n:m_all){
-                if(teamEq(n->team,team)) continue;
-                for(auto& c:n->children)
-                    if(c && segCross(src,tgt,n->pos,c->pos)) crossEdges.insert(c.get());
-            }
-            int dmg = (parent->attack>=1)?parent->attack:1;
-            // 命中节点本体: 削弱该节点连接父边的强度 (伤害=源节点攻击力), 归零 → 摧毁
-            for(Node* t:hitNodes){
-                if(std::find(m_all.begin(),m_all.end(),t)==m_all.end())continue;
-                if(t->removed)continue;
-                if(!t->parent){ killSubtree(t); continue; }
-                t->edgeStrength-=dmg;
-                if(t->edgeStrength<=0) killSubtree(t);
-            }
-            if(!m_rRoot || !m_bRoot) return;
-            // 穿越边: 削弱线段强度, 归零 → 整棵子树摧毁
-            for(Node* c:crossEdges){
-                if(std::find(m_all.begin(),m_all.end(),c)==m_all.end())continue;
-                c->edgeStrength-=dmg;
-                if(c->edgeStrength<=0) killSubtree(c);
+            // ===== 攻击效果 =====
+            if(m_repUseAff){
+                // BTBDT3: 精确攻击结果 — 直接应用 (消除坐标舍入导致的几何判定翻转; 空 aff=无效果)
+                for(auto&p:ra.aff){
+                    Node* t=nodeById(p.first);
+                    if(!t) continue;
+                    if(p.second<=0){
+                        if(std::find(m_all.begin(),m_all.end(),t)!=m_all.end()) killSubtree(t);
+                    } else {
+                        t->edgeStrength=p.second;
+                    }
+                }
+            } else {
+                // 旧文件 (BTBDT1/BTBDT2): 按几何重算攻击效果 (与真实对局一致)
+                PointF src=parent->pos, tgt={ra.tx,ra.ty};
+                std::set<Node*> hitNodes, crossEdges;
+                for(auto*n:m_all){
+                    if(teamEq(n->team,team)) continue;
+                    if(ptEq(n->pos,src)||ptEq(n->pos,tgt)) continue;
+                    if(ptSegDist(n->pos,src,tgt)<NODE_R+ATK_M) hitNodes.insert(n);
+                }
+                for(auto*n:m_all){
+                    if(teamEq(n->team,team)) continue;
+                    for(auto& c:n->children)
+                        if(c && segCross(src,tgt,n->pos,c->pos)) crossEdges.insert(c.get());
+                }
+                int dmg = (ra.atk>=1) ? ra.atk : ((parent->attack>=1)?parent->attack:1);
+                for(Node* t:hitNodes){
+                    if(std::find(m_all.begin(),m_all.end(),t)==m_all.end())continue;
+                    if(t->removed)continue;
+                    if(!t->parent){ killSubtree(t); continue; }
+                    t->edgeStrength-=dmg;
+                    if(t->edgeStrength<=0) killSubtree(t);
+                }
+                if(!m_rRoot || !m_bRoot) return;
+                for(Node* c:crossEdges){
+                    if(std::find(m_all.begin(),m_all.end(),c)==m_all.end())continue;
+                    c->edgeStrength-=dmg;
+                    if(c->edgeStrength<=0) killSubtree(c);
+                }
             }
         } else if(ra.type==1){
-            // 强化: px,py 是边子节点位置
-            for(auto*n:m_all)
-                if(fabs(n->pos.X-ra.px)<1.f && fabs(n->pos.Y-ra.py)<1.f && n->parent){
-                    n->edgeStrength=ra.strength; break;
-                }
+            // 强化: 目标边子节点
+            Node* tgtNode = nodeById(ra.pid);
+            if(!tgtNode && ra.pid<0)
+                for(auto*n:m_all)
+                    if(fabs(n->pos.X-ra.px)<1.f && fabs(n->pos.Y-ra.py)<1.f && n->parent){tgtNode=n;break;}
+            if(tgtNode && tgtNode->parent) tgtNode->edgeStrength=ra.strength;
         } else if(ra.type==5){
             // 增强节点攻击力
-            for(auto*n:m_all)
-                if(fabs(n->pos.X-ra.px)<1.f && fabs(n->pos.Y-ra.py)<1.f){
-                    n->attack = ra.strength; break;
-                }
+            Node* tgtNode = nodeById(ra.pid);
+            if(!tgtNode && ra.pid<0)
+                for(auto*n:m_all)
+                    if(fabs(n->pos.X-ra.px)<1.f && fabs(n->pos.Y-ra.py)<1.f){tgtNode=n;break;}
+            if(tgtNode) tgtNode->attack = ra.strength;
         } else if(ra.type==3){
             // 删除节点 (整棵子树销毁)
-            for(auto*n:m_all)
-                if(fabs(n->pos.X-ra.px)<1.f && fabs(n->pos.Y-ra.py)<1.f && n->parent){
-                    deleteNode(n); break;
-                }
+            Node* tgtNode = nodeById(ra.pid);
+            if(!tgtNode && ra.pid<0)
+                for(auto*n:m_all)
+                    if(fabs(n->pos.X-ra.px)<1.f && fabs(n->pos.Y-ra.py)<1.f && n->parent){tgtNode=n;break;}
+            if(tgtNode && tgtNode->parent) deleteNode(tgtNode);
         }
         // ===== 得分黄点: 收集 + 实时统计 =====
         if(ra.type==0 && parent){
@@ -929,13 +1265,19 @@ private:
     void replayJumpTo(int idx){
         if(idx<0) idx=0;
         if(idx>(int)m_repActs.size()) idx=(int)m_repActs.size();
+        replayApplyMapSize();
         m_all.clear();
         for(int i=0;i<4;++i) m_roots[i].reset();
         m_players = (m_repPlayers==4) ? 4 : 2;
+        m_nextRid = 2;   // 回放节点 ID 从 2 开始 (0/1 留给根)
         m_roots[0]=std::make_unique<Node>(Node{{80,80},CLR_TEAMS[0]});
+        m_roots[0]->rid=0;
         m_roots[1]=std::make_unique<Node>(Node{{WIN_W-80.f,WIN_H-80.f},CLR_TEAMS[1]});
+        m_roots[1]->rid=1;
         if(m_players>=3) m_roots[2]=std::make_unique<Node>(Node{{WIN_W-80.f,80.f},CLR_TEAMS[2]});
+        if(m_players>=3) m_roots[2]->rid=2;
         if(m_players>=4) m_roots[3]=std::make_unique<Node>(Node{{80.f,WIN_H-80.f},CLR_TEAMS[3]});
+        if(m_players>=4) m_roots[3]->rid=3;
         for(int i=0;i<m_players;++i) m_all.push_back(m_roots[i].get());
         m_plyScores[0]=m_repRs; m_plyScores[1]=m_repBs; m_plyScores[2]=m_repGs; m_plyScores[3]=m_repYs;
         m_rng.seed(0x5EED);   // 固定种子: 补充黄点序列与从头播放一致
@@ -1062,12 +1404,38 @@ private:
             m_winner = (alive==1) ? (winnerIdx==0?L"Red":winnerIdx==1?L"Blue":winnerIdx==2?L"Green":L"Yellow")
                                   : L"Nobody";
             m_state=State::GameOver;
+            m_restartClock.Restart();   // 结算计时: 自我对弈续局延迟 / overlay 时序
         }
-        if(m_over && !m_replaySaved){   // 按模式决定是否自动保存对局
+        if(m_over && !m_replaySaved && !m_suppressAutoSave){   // 按模式决定是否自动保存对局
             m_replaySaved=true;
-            bool wantSave = m_bothAI ? m_settings.saveAva
+            bool wantSave = m_bothAI ? true                       // 自我对弈必须保存录像供学习升级
                           : (m_aiMode ? m_settings.savePva : m_settings.savePvp);
-            if(wantSave) saveReplay();
+            std::wstring saved;
+            if(wantSave) saved = saveReplay();
+            // ===== AI 自我对弈升级: 胜方 AI 学习本局录像并写回 reasoner =====
+            if(m_bothAI){
+                m_evolveDone++;
+                bool redWin=(m_winner==L"Red"), blueWin=(m_winner==L"Blue");
+                if((redWin||blueWin) && !saved.empty()){
+                    AI& winnerAI = redWin ? m_aiRed : m_aiBlue;
+                    int reasoner = redWin ? m_redReasoner : m_blueReasoner;
+                    bool& loaded = redWin ? m_redReasonerLoaded : m_blueReasonerLoaded;
+                    if(loaded){
+                        // 录像路径转窄字符后喂给 AI 学习
+                        std::string p;
+                        for(wchar_t c: saved) p+=(char)c;
+                        winnerAI.learnFromReplayFile(p);
+                        winnerAI.saveToFile(reasonerPath(reasoner).c_str());   // 升级写回 (胜者版本成为下一代基准)
+                        m_evolveLearnCount++;
+                        // 窄字符 → 宽字符 (文件名)
+                        std::string rp = reasonerPath(reasoner);
+                        std::wstring wrp; int n=MultiByteToWideChar(CP_UTF8,0,rp.c_str(),-1,nullptr,0);
+                        if(n>0){ wrp.resize(n-1); MultiByteToWideChar(CP_UTF8,0,rp.c_str(),-1,&wrp[0],n); }
+                        m_evolveLastMsg = L"Round "+std::to_wstring(m_evolveDone)+L": "+m_winner
+                                        +L" selected (mutated+learned) & saved → "+wrp;
+                    }
+                }
+            }
         }
     }
 
@@ -1127,16 +1495,18 @@ private:
     int enScoreOf(const Color& c){ return (int)(teamEq(c,CLR_RED)?m_bScore:m_rScore); }
 
     // ===== AI 配置 (ai_*.dat) =====
-    // 扫描当前目录所有 ai_*.dat (文件名前缀 ai_ 即可, 内容符合规范)
+    // 扫描 AI 子目录 (AI\ai_*.dat, 文件名前缀 ai_ 即可, 内容符合规范)
     // 不自动生成: 没有 dat 时列表为空, 由菜单提示无法对战
+    // AI 目录相对于 exe 所在目录 (例如 build/AI/)
     void scanReasoners(){
         m_reasoners.clear();
+        CreateDirectoryA("AI", nullptr);   // 确保 AI 子目录存在
         WIN32_FIND_DATAA fd;
-        HANDLE h = FindFirstFileA("ai_*.dat", &fd);
+        HANDLE h = FindFirstFileA("AI\\ai_*.dat", &fd);
         if(h != INVALID_HANDLE_VALUE){
             do {
                 if(!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
-                    m_reasoners.push_back(fd.cFileName);
+                    m_reasoners.push_back(std::string("AI\\") + fd.cFileName);
             } while(FindNextFileA(h, &fd));
             FindClose(h);
         }
@@ -1148,7 +1518,7 @@ private:
         }
     }
     std::string reasonerPath(int idx){
-        if(idx<0 || idx>=(int)m_reasoners.size()) return "ai_reasoner_0001.dat";
+        if(idx<0 || idx>=(int)m_reasoners.size()) return "AI\\ai_reasoner_0001.dat";
         return m_reasoners[idx];
     }
     // 把 reasoner 配置载入指定 AI, 并标记已加载(退出时回写)
@@ -1180,32 +1550,59 @@ private:
         if(m_over)return;
         int scVal = scoreOf(team);                       // 解密
         ai.setAttackMax(m_settings.attackMax);           // 设置节点攻击力上限 (reinforce 前)
-        // AI 防守强化: 记录到回放 (每条 type=1, 含积分变化)
+        ai.setRules(m_settings.extendCost, m_settings.reinfCost,
+                    m_settings.attackCost, m_settings.extendMax);   // 游戏规则成本 (reinforce 前)
+        // AI 防守强化 + 攻击升级: 记录到回放 (type=1 强化 / type=5 攻击升级, 含精确积分变化)
+        // 注意: 攻击升级此前未记录 → 回放分数凭空消失 + 攻击力状态与现场不一致 (对局败因之一)
         {
             int scPre = scVal;
-            std::map<Node*,int> before;
+            std::map<Node*,int> before, beforeAtk;
             for(auto*n : m_all)
-                if(teamEq(n->team, team) && n->parent && !n->isolated && !n->removed)
-                    before[n] = n->edgeStrength;
-            ai.reinforce(m_all, scVal, enScoreOf(team), team); // 先防守强化
+                if(teamEq(n->team, team) && !n->isolated && !n->removed){
+                    if(n->parent) before[n] = n->edgeStrength;
+                    beforeAtk[n] = n->attack;
+                }
+            ai.reinforce(m_all, scVal, enScoreOf(team), team); // 先防守强化/攻击升级
             int run = scPre;
+            // 边强化 (type=1): 花费 = 级数 × reinfCost
             for(auto& kv : before){
                 Node* ch = kv.first;
                 if(ch->edgeStrength > kv.second){
                     int up = ch->edgeStrength - kv.second;
-                    if(up>0){
-                        recordAction(1, ch, ch->pos, ch->edgeStrength, 0, run, run-up, team);
-                        run -= up;
+                    int cst = up * std::max(1,m_settings.reinfCost);
+                    if(up>0 && cst>0){
+                        recordAction(1, ch, ch->pos, ch->edgeStrength, 0, run, run-cst, team);
+                        run -= cst;
+                    }
+                }
+            }
+            // 攻击升级 (type=5): 花费 = 级数 × attackCost
+            for(auto& kv : beforeAtk){
+                Node* nn = kv.first;
+                if(nn->attack > kv.second){
+                    int up = nn->attack - kv.second;
+                    int cst = up * std::max(1,m_settings.attackCost);
+                    if(up>0 && cst>0){
+                        recordAction(5, nn, nn->pos, nn->attack, 0, run, run-cst, team);
+                        run -= cst;
                     }
                 }
             }
         }
         scoreOf(team) = scVal;                           // 加密写回
         ai.setDifficulty(m_diff);                        // 设置 AI 难度
-        // 思考时间按难度: Easy 短 / Normal 中 / Hard 长
-        if(m_diff==2){ m_minThink=5200; m_maxThink=8500; }
-        else if(m_diff==0){ m_minThink=1800; m_maxThink=3200; }
-        else { m_minThink=2500; m_maxThink=4800; }
+        // 思考时间: 设置中的 AI 思考时间上限 (aiThinkMs, 毫秒) 优先; 未配置时按难度
+        {
+            int capMs = m_settings.aiThinkMs;
+            if(capMs>0){
+                m_minThink = (ULONGLONG)(capMs*3/5);   // 最短思考 = 上限的 60%
+                m_maxThink = (ULONGLONG)capMs;         // 最长思考 = 上限
+            } else {
+                if(m_diff==2){ m_minThink=5200; m_maxThink=8500; }
+                else if(m_diff==0){ m_minThink=1800; m_maxThink=3200; }
+                else { m_minThink=2500; m_maxThink=4800; }
+            }
+        }
         ai.beginThink(m_all,myRootOf(team),enRootOf(team),scVal,enScoreOf(team),m_scores,team);
         m_thinkingAI=&ai;
         m_thinkingTeam=team;
@@ -1222,26 +1619,46 @@ private:
         SecureInt& sc=scoreOf(team);
         if(sc<0) sc=0;   // 防御: 分数不为负
         int cost=mv.extend*m_settings.extendCost+(mv.strength-DEF_S)*m_settings.reinfCost;
-        if(cost>sc)return;
+        if(cost>sc){ m_aiMoveRejected++; return; }   // 成本模型失配时 AI 会做出付不起的行动 (浪费回合)
         int scBefore=(int)sc;
         sc-=cost;
         auto nd=std::make_unique<Node>();
         nd->pos=mv.target; nd->team=team; nd->parent=mv.parent;
-        nd->edgeStrength=mv.strength;
+        nd->edgeStrength=mv.strength; nd->rid=m_nextRid++;
         Node* raw=nd.get();
         mv.parent->children.push_back(std::move(nd));
         m_all.push_back(raw);
         collectAt(mv.parent->pos, mv.target);
         AttackPreview ap=previewAttack(mv.parent->pos,mv.target,team, mv.parent->attack);
-        processAttack(mv.parent->pos,mv.target, mv.parent->attack);
+        AttackResult res=processAttack(mv.parent->pos,mv.target, mv.parent->attack);
         m_didBranch=true; checkVictory();
-        // 记录行动
+        // 记录行动 (含精确攻击结果 aff)
         recordAction(0, mv.parent, mv.target, mv.strength, mv.extend,
-                     scBefore, (int)sc, team);
-        // 攻击战果
+                     scBefore, (int)sc, team, &res);
+        // 攻击战果 (记录后同步预览计数, 与 aff 一致)
         if(!m_replay.empty()){
             m_replay.back().nodesKilled=ap.nodesHit;
             m_replay.back().edgesKilled=ap.edgesKilled;
+        }
+        // ===== AI 死循环检测: 同一方连续 >=3 回合下到相同点位 → 强制结束本局 =====
+        // 容差 8px (节点占位 30px, 微小抖动/交替两点都算"同点位"), 防止振荡死循环
+        if(m_bothAI || m_aiMode){   // AI 对局才检测 (人类玩家不受限)
+            int ti = idxOfTeam(team);
+            if(len2(mv.target, m_lastMoveTgt[ti])<8.f)
+                m_sameMoveCount[ti]++;
+            else {
+                m_lastMoveTgt[ti] = mv.target;
+                m_sameMoveCount[ti] = 1;
+            }
+            if(m_sameMoveCount[ti] >= 3 && !m_over){
+                m_over = true;
+                m_winner = L"Nobody";
+                m_state = State::GameOver;
+                m_restartClock.Restart();
+                m_evolveLastMsg = L"Round "+std::to_wstring(m_evolveDone+1)
+                                +L": DEAD-LOOP (same position x3) — forced draw";
+                checkVictory();   // 走正常结算: 保存录像 + 自我对弈计数
+            }
         }
     }
 
@@ -1296,200 +1713,6 @@ private:
         m_aiThinking=false; m_thinkingAI=nullptr;
     }
 
-    // ===================== 插件 AI (ai_plugins\*.dll) =====================
-    // 把当前局面序列化为 AIPluginState (每次决策前重建)
-    void buildPluginState(AIPluginState& st,
-                          std::vector<AIPluginNode>& anode,
-                          std::vector<AIPluginScorePoint>& apts,
-                          std::vector<Node*>& id2node,
-                          const Color& team){
-        std::map<Node*,int> idx;
-        anode.clear(); id2node.clear();
-        for(auto* n : m_all){
-            idx[n]=(int)id2node.size();
-            AIPluginNode an; memset(&an,0,sizeof an);
-            an.id=(int)id2node.size();
-            an.team=teamEq(n->team,CLR_RED)?0:1;
-            an.x=n->pos.X; an.y=n->pos.Y;
-            an.edgeStrength=n->edgeStrength;
-            an.level=n->level;
-            an.isolated=n->isolated?1:0;
-            anode.push_back(an);
-            id2node.push_back(n);
-        }
-        for(int i=0;i<(int)id2node.size();++i){
-            Node* n=id2node[i];
-            anode[i].parentId=(n->parent && idx.count(n->parent))?idx[n->parent]:-1;
-            int k=0;
-            for(auto& c : n->children){
-                if(k>=2) break;
-                if(idx.count(c.get())) anode[i].children[k++]=idx[c.get()];
-            }
-            anode[i].childCount=k;
-        }
-        apts.clear();
-        for(auto& sp : m_scores){
-            if(!sp.alive) continue;
-            AIPluginScorePoint ap;
-            ap.x=sp.pos.X; ap.y=sp.pos.Y; ap.value=sp.value; ap.alive=1;
-            apts.push_back(ap);
-        }
-        st.apiVersion=AI_PLUGIN_API_VERSION;
-        st.nodeCount=(int)anode.size();
-        st.nodes=anode.empty()?nullptr:anode.data();
-        st.scorePointCount=(int)apts.size();
-        st.scorePoints=apts.empty()?nullptr:apts.data();
-        st.redScore=(int)m_rScore;
-        st.blueScore=(int)m_bScore;
-        st.myTeam=teamEq(team,CLR_RED)?0:1;
-        st.maxBranchLength=MAX_D+3*EXTRA_D;
-        st.nodeRadius=NODE_R;
-        st.occupyRadius=OCCUPY_R;
-        st.mapWidth=WIN_W;
-        st.mapHeight=WIN_H;
-    }
-    // 执行插件返回的一步 (校验 + 落地 + 记录回放)
-    bool pluginExecuteMove(const AIPluginMove& mv, const std::vector<Node*>& id2node){
-        auto nodeAt=[&](int id)->Node*{
-            if(id<0||id>=(int)id2node.size()) return nullptr;
-            return id2node[id];
-        };
-        if(mv.action==AI_ACT_BRANCH){
-            Node* p=nodeAt(mv.parentId);
-            if(!p || !teamEq(p->team,m_turn) || p->isolated || p->children.size()>=2) return false;
-            PointF tgt{mv.targetX,mv.targetY};
-            float d=len2(p->pos,tgt);
-            int cost=mv.extend*m_settings.extendCost+(mv.strength-DEF_S)*m_settings.reinfCost;
-            SecureInt& sc=scoreOf(m_turn);
-            if(d>20 && d<=MAX_D+mv.extend*EXTRA_D && mv.strength>=DEF_S && mv.strength<=MAX_S
-               && mv.extend>=0 && mv.extend<=3 && cost>=0 && cost<=(int)sc
-               && tgt.X>=10 && tgt.X<=WIN_W-10 && tgt.Y>=10 && tgt.Y<=WIN_H-10){
-                bool occ=false;
-                for(auto*n:m_all) if(n!=p && len2(n->pos,tgt)<OCCUPY_R){occ=true;break;}
-                if(occ) return false;
-                saveState();
-                int scBefore=(int)sc;
-                sc-=cost;
-                auto nd=std::make_unique<Node>();
-                nd->pos=tgt; nd->team=m_turn; nd->parent=p; nd->edgeStrength=mv.strength;
-                Node* raw=nd.get();
-                p->children.push_back(std::move(nd));
-                m_all.push_back(raw);
-                AttackPreview ap=previewAttack(p->pos,tgt,m_turn, p->attack);
-                collectAt(p->pos,tgt); processAttack(p->pos,tgt, p->attack);
-                m_didBranch=true; checkVictory();
-                recordAction(0,p,tgt,mv.strength,mv.extend,scBefore,(int)sc,m_turn);
-                if(!m_replay.empty()){ m_replay.back().nodesKilled=ap.nodesHit; m_replay.back().edgesKilled=ap.edgesKilled; }
-                return true;
-            }
-            return false;
-        } else if(mv.action==AI_ACT_REINF_EDGE){
-            Node* c=nodeAt(mv.targetId);
-            if(!c || !teamEq(c->team,m_turn) || !c->parent || c->isolated) return false;
-            int ns=mv.strength; if(ns<1)ns=1; if(ns>MAX_S)ns=MAX_S;
-            int cost=ns-c->edgeStrength;
-            SecureInt& sc=scoreOf(m_turn);
-            if(cost>0 && cost<=(int)sc){
-                int scBefore=(int)sc;
-                sc-=cost; c->edgeStrength=ns;
-                recordAction(1,c,c->pos,ns,0,scBefore,(int)sc,m_turn);
-                return true;
-            }
-            return false;
-        }
-        // AI_ACT_UPGRADE_NODE: 节点加强机制已移除, 该动作不再生效
-        return false;
-    }
-    // 插件回合流程: 循环 getMove → 执行, 直到分支或无效; 支持额外行动
-    void startPluginThink(const Color& team){
-        int idx = teamEq(team,CLR_RED) ? m_redPlugin : m_bluePlugin;
-        if(idx<0 || idx>=(int)m_plugins.size()) return;
-        AIPlugin& pl=m_plugins[idx];
-        if(!pl.loaded || !pl.fnGetMove) return;
-        for(int step=0; step<24; ++step){
-            std::vector<AIPluginNode> anode;
-            std::vector<AIPluginScorePoint> apts;
-            std::vector<Node*> id2node;
-            AIPluginState st;
-            buildPluginState(st,anode,apts,id2node,team);
-            if(pl.fnThinkStart) pl.fnThinkStart(&st);
-            AIPluginMove mv; memset(&mv,0,sizeof mv);
-            if(!pl.fnGetMove(&st,&mv)) break;
-            if(!mv.valid) break;
-            if(!pluginExecuteMove(mv,id2node)) break;
-            if(mv.action==AI_ACT_BRANCH){
-                // 额外行动: 买 3 分再走一步 (仅分支可触发)
-                if(mv.buyExtra && !m_over && (int)scoreOf(team)>=EXTRA_COST){
-                    SecureInt& sc=scoreOf(team);
-                    int scBefore=(int)sc;
-                    sc-=EXTRA_COST; m_didBranch=false;
-                    recordAction(2,nullptr,{0.f,0.f},0,0,scBefore,(int)sc,team);
-                    std::vector<AIPluginNode> a2;
-                    std::vector<AIPluginScorePoint> p2;
-                    std::vector<Node*> id2n2;
-                    AIPluginState st2;
-                    buildPluginState(st2,a2,p2,id2n2,team);
-                    AIPluginMove mv2; memset(&mv2,0,sizeof mv2);
-                    if(pl.fnGetMove(&st2,&mv2) && mv2.valid && mv2.action==AI_ACT_BRANCH){
-                        pluginExecuteMove(mv2,id2n2);
-                    }
-                    m_didBranch=true;
-                }
-                break;
-            }
-            // 强化/加强节点: 不消耗回合, 继续问插件下一步
-        }
-        // 结束回合
-        if(!m_over){ advanceTurn(); m_didBranch=false; m_xUsedThisTurn=false; m_enterClock.Restart(); m_replayTurn++; }
-        InvalidateRect(m_hwnd,nullptr,FALSE);
-    }
-    // 拉取插件上报的候选落点 (热力图调试用)
-    void populatePluginCands(const Color& team){
-        int idx = teamEq(team,CLR_RED) ? m_redPlugin : m_bluePlugin;
-        if(idx<0 || idx>=(int)m_plugins.size()) return;
-        AIPlugin& pl=m_plugins[idx];
-        if(!pl.loaded || !pl.fnGetCands) return;
-        std::vector<AIPluginNode> anode;
-        std::vector<AIPluginScorePoint> apts;
-        std::vector<Node*> id2node;
-        AIPluginState st;
-        buildPluginState(st,anode,apts,id2node,team);
-        m_pluginCands.clear();
-        m_pluginCands.resize(AI_PLUGIN_MAX_CANDS);
-        int n = pl.fnGetCands(&st, m_pluginCands.data(), AI_PLUGIN_MAX_CANDS);
-        if(n<0) n=0;
-        if(n>(int)m_pluginCands.size()) n=(int)m_pluginCands.size();
-        m_pluginCands.resize(n);
-    }
-    // 渲染插件候选热力图 (蓝→黄→红, 值越大越红)
-    void drawPluginHeat(Graphics& g){
-        if(m_pluginCands.empty()) return;
-        float mn=1e9f,mx=-1e9f;
-        for(auto&c:m_pluginCands){mn=std::min(mn,c.score);mx=std::max(mx,c.score);}
-        float range=mx-mn; if(range<0.001f) range=1.f;
-        auto heat=[&](float t)->Color{
-            t=std::max(0.f,std::min(1.f,t));
-            if(t<0.5f){float u=t*2.f; return Color(200,(BYTE)(60+u*120),(BYTE)(150+u*80),(BYTE)(255-u*200));}
-            float u=(t-0.5f)*2.f; return Color(210,(BYTE)(180+u*75),(BYTE)(230-u*140),(BYTE)(55-u*55));
-        };
-        textC(g, L"Plugin candidate heatmap",
-              WIN_W/2.f, 14, Color(255,120,120,130), 13, true);
-        for(auto&c : m_pluginCands){
-            float t=(c.score-mn)/range;
-            float rad=6+t*12;
-            Color col=heat(t);
-            SolidBrush br(Color(150,col.GetR(),col.GetG(),col.GetB()));
-            g.FillEllipse(&br,c.x-rad,c.y-rad,rad*2,rad*2);
-            Pen pn(Color(220,col.GetR(),col.GetG(),col.GetB()),1.5f);
-            g.DrawEllipse(&pn,c.x-rad,c.y-rad,rad*2,rad*2);
-            int pct=(int)(t*100.f);
-            if(pct>=20){
-                std::wstring s=std::to_wstring(pct)+L"%";
-                textC(g,s,c.x,c.y-3,Color(255,30,30,30),10,true);
-            }
-        }
-    }
-
     // ===== 输入 =====
     Node* findEdgeAt(PointF m){
         Node*best=nullptr; float bd=12;
@@ -1509,7 +1732,7 @@ private:
             int pg=menuPageBtnHit(m);
             if(pg!=0){ repPageTurn(pg); return; }
             // 设置一级/二级菜单右上角返回按钮
-            if((m_menuPhase==8||m_menuPhase==9||m_menuPhase==10||m_menuPhase==11) && menuBackBtnHit(m)){
+            if((m_menuPhase==8||m_menuPhase==9||m_menuPhase==10||m_menuPhase==11||m_menuPhase==14) && menuBackBtnHit(m)){
                 menuBackAction(); return;
             }
             if(m_menuPhase==11){   // 游戏规则二级菜单: 行内 −/+ 按钮点击调整数值
@@ -1525,21 +1748,27 @@ private:
                 }
                 return;
             }
-            int hit=menuHitOption(m);
-            if(hit>=0){
-                if(m_menuPhase==12){
-                    // 回放列表: 点击非选中行仅移动蓝色框; 点击当前蓝色选中行才进入回放
-                    if(hit==m_menuSel) menuActivate();
-                    else m_menuSel=hit;
-                }else{
-                    m_menuSel=hit; menuActivate();
+            if(m_menuPhase==14){   // AI & 进化二级菜单: 行内 −/+ 按钮点击调整数值
+                float py=440.f;
+                for(int i=0;i<2;++i,py+=50.f){
+                    if(m.Y>=py-18.f && m.Y<=py+18.f){
+                        float bx=FULL_W/2.f+196.f;
+                        if(m.X>=bx-14.f && m.X<=bx+14.f){ m_menuSel=i; aiEvolveAdjust(i,-1); return; }
+                        if(m.X>=bx+26.f && m.X<=bx+54.f){ m_menuSel=i; aiEvolveAdjust(i,1); return; }
+                        m_menuSel=i;   // 点击行仅选中
+                        return;
+                    }
                 }
+                return;
             }
+            int hit=menuHitOption(m);
+            if(hit>=0) m_menuSel=hit;   // 单击仅选中, 双击 (onDblClick) 才进入
             return;
         }
         // 结算界面: 点击返回主菜单 (延迟2秒防误触)
         if(m_state==State::GameOver){
             if(m_restartClock.GetElapsedTime()>2.f){
+                m_evolveActive=false;   // 手动退出: 停止自我对弈
                 m_state=State::Menu; m_over=false;
             }
             return;
@@ -1548,7 +1777,7 @@ private:
         if(m_state==State::Replay){
             // 返回按钮 (与 drawReplayUI 绘制位置一致)
             if(m.X>=WIN_W-160.f && m.X<=WIN_W-40.f && m.Y>=12.f && m.Y<=52.f){
-                m_state=State::Menu;
+                leaveReplay();
                 return;
             }
             float bx=20.f, by=WIN_H-34.f, bw=WIN_W-40.f;
@@ -1567,6 +1796,19 @@ private:
             if(len2(n->pos,m)<NODE_R*2&&teamEq(n->team,m_turn)&&n->children.size()<2){
                 m_nodeMenu=nullptr; clearReinf();m_sel=n;m_extend=0;m_str=DEF_S;return;
             }
+    }
+    // 双击进入: 菜单项单击选中后, 双击才激活 (进入下一级/开始)
+    void onDblClick(PointF m){
+        if(m_state==State::Menu){
+            int hit=menuHitOption(m);
+            if(hit>=0){
+                m_menuSel=hit;
+                menuActivate();
+                m_menuHover=-1;
+            }
+            return;
+        }
+        onPress(m);   // 非菜单状态双击按单击处理, 不影响玩法
     }
     void onRPress(PointF m){
         if(m_state!=State::Playing||m_over)return;
@@ -1606,16 +1848,17 @@ private:
             int scBefore=(int)sc;
             sc-=cost;
             auto nd=std::make_unique<Node>();
-            nd->pos=m; nd->team=m_turn; nd->parent=m_sel; nd->edgeStrength=m_str;
+            nd->pos=m; nd->team=m_turn; nd->parent=m_sel; nd->edgeStrength=m_str; nd->rid=m_nextRid++;
             Node*raw=nd.get();
             m_sel->children.push_back(std::move(nd));
             m_all.push_back(raw);
             PointF src=m_sel->pos;
             AttackPreview ap=previewAttack(src,m,m_turn, m_sel->attack);
-            collectAt(m_sel->pos,m); processAttack(src,m, m_sel->attack);
+            collectAt(m_sel->pos,m);
+            AttackResult res=processAttack(src,m, m_sel->attack);
             m_didBranch=true; checkVictory();
-            // 记录行动
-            recordAction(0, m_sel, m, m_str, m_extend, scBefore, (int)sc, m_turn);
+            // 记录行动 (含精确攻击结果 aff)
+            recordAction(0, m_sel, m, m_str, m_extend, scBefore, (int)sc, m_turn, &res);
             if(!m_replay.empty()){
                 m_replay.back().nodesKilled=ap.nodesHit;
                 m_replay.back().edgesKilled=ap.edgesKilled;
@@ -1631,7 +1874,8 @@ private:
     void onWheel(float d){
         if(!m_sel||m_state!=State::Playing||m_aiThinking)return;
         SecureInt& sc=scoreOf(m_turn);
-        if(d>0){if(m_str<MAX_S&&m_str-DEF_S<sc)++m_str;}
+        // 允许性判断用实际消耗 (按设置成本, 此前用级数导致买不起时仍能上调)
+        if(d>0){if(m_str<MAX_S&&(m_str+1-DEF_S)*m_settings.reinfCost<=sc)++m_str;}
         else{if(m_str>DEF_S)--m_str;}
     }
     // ===== 菜单鼠标支持 =====
@@ -1642,9 +1886,14 @@ private:
         case 0:  // 主菜单 5 项
             for(int i=0;i<5;++i) if(hitRow(430.f+i*44.f)) return i;
             return -1;
-        case 8: { // 设置页 6 行 (地图/保存/规则/3 快捷键)
-            float ys[6]={424.f,456.f,488.f,518.f,548.f,578.f};
-            for(int i=0;i<6;++i) if(hitRow(ys[i])) return i;
+        case 8: { // 设置页 7 行 (地图/保存/规则/3 快捷键/AI与进化)
+            float ys[7]={424.f,456.f,488.f,518.f,548.f,578.f,608.f};
+            for(int i=0;i<7;++i) if(hitRow(ys[i])) return i;
+            return -1;
+        }
+        case 14: { // AI & 进化二级菜单 2 行
+            float py=440.f;
+            for(int i=0;i<2;++i,py+=50.f) if(hitRow(py)) return i;
             return -1;
         }
         case 11: { // 游戏规则 7 行
@@ -1683,16 +1932,49 @@ private:
             for(int i=start;i<std::min(cnt,start+VIS);++i,py+=38.f) if(hitRow(py)) return i;
             return -1;
         }
-        case 2: case 5: case 7: { // 难度/插件
+        case 2: case 5: case 7: { // 难度选择 (Easy/Normal/Hard)
             if(hitRow(448.f)) return 0;
             if(hitRow(478.f)) return 1;
             if(hitRow(508.f)) return 2;
-            int shown=std::min((int)m_plugins.size(),3);
-            float py=540.f;
-            for(int i=0;i<shown;++i,py+=32.f) if(hitRow(py)) return 3+i;
             return -1;
         }
         default: return -1;
+        }
+    }
+    // 返回菜单项在屏幕上的中心行坐标 (与 menuHitOption 布局一致); 无效返回 false
+    bool menuItemCenterY(int idx, float& cy){
+        switch(m_menuPhase){
+        case 0: if(idx<0||idx>=5) return false; cy=430.f+idx*44.f; return true;
+        case 8: { static const float ys[7]={424.f,456.f,488.f,518.f,548.f,578.f,608.f};
+                  if(idx<0||idx>=7) return false; cy=ys[idx]; return true; }
+        case 14: if(idx<0||idx>=2) return false; cy=440.f+idx*50.f; return true;
+        case 11: if(idx<0||idx>=7) return false; cy=428.f+idx*34.f; return true;
+        case 9:  if(idx<0||idx>=3) return false; cy=440.f+idx*42.f; return true;
+        case 10: if(idx<0||idx>=3) return false; cy=452.f+idx*44.f; return true;
+        case 12: {
+            int cnt=(int)m_replays.size();
+            if(cnt==0||idx<0||idx>=cnt) return false;
+            int start=m_repPage*REP_PAGE;
+            int vi=idx-start;
+            if(vi<0||vi>=REP_PAGE) return false;
+            cy=422.f+vi*26.f; return true;
+        }
+        case 1: case 4: case 6: {
+            int cnt=(int)m_reasoners.size();
+            if(cnt==0||idx<0||idx>=cnt) return false;
+            const int VIS=6;
+            int start=cnt<=VIS?0:std::max(0,std::min(m_menuSel-VIS/2,cnt-VIS));
+            int vi=idx-start;
+            if(vi<0||vi>=VIS) return false;
+            cy=440.f+vi*38.f; return true;
+        }
+        case 2: case 5: case 7: {
+            if(idx==0){cy=448.f;return true;}
+            if(idx==1){cy=478.f;return true;}
+            if(idx==2){cy=508.f;return true;}
+            return false;
+        }
+        default: return false;
         }
     }
     // ===== 设置二级菜单右上角返回按钮 (仅 9=地图尺寸 10=保存对局 11=游戏规则) =====
@@ -1710,6 +1992,7 @@ private:
         else if(m_menuPhase==9){ m_menuPhase=8; m_menuSel=0; }
         else if(m_menuPhase==10){ m_menuPhase=8; m_menuSel=1; }
         else if(m_menuPhase==11){ m_menuPhase=8; m_menuSel=2; saveSettings(); }
+        else if(m_menuPhase==14){ m_menuPhase=8; m_menuSel=6; saveSettings(); }
         m_enterClock.Restart();
     }
     // 绘制返回按钮 (悬停高亮)
@@ -1719,6 +2002,17 @@ private:
         panel(g,bx,by,bw,bh, hover?Color(255,230,235,250):Color(255,248,248,250),
               Color(255,80,110,190), hover?2.f:1.5f);
         textC(g,L"◀  Back",bx+bw/2.f,by+bh/2.f,Color(255,40,60,110),15,true);
+    }
+    // ===== AI & 进化二级菜单 (menuPhase==14): 0=AI思考时间 1=自我对弈局数 =====
+    void aiEvolveAdjust(int idx,int dir){
+        if(idx==0){  // AI 思考时间 (毫秒, 50~10000, 即 0.05s~10s)
+            int nv=m_settings.aiThinkMs+dir*50;
+            m_settings.aiThinkMs=std::max(50,std::min(10000,nv));
+        }else{       // 自我对弈局数 (5~1000)
+            int nv=m_settings.evolveRounds+dir*5;
+            m_settings.evolveRounds=std::max(5,std::min(1000,nv));
+        }
+        saveSettings();
     }
     // ===== 回放列表左右翻页按钮 (menuPhase==12) =====
     // 左右按钮矩形 (垂直居中于列表区)
@@ -1793,21 +2087,19 @@ private:
                 m_menuPhase=12; m_menuSel=0; m_enterClock.Restart(); return;
             }
             if(m_menuSel==1){                                                                          // vs AI
-                m_redPlugin=-1; m_redDiff=1;
+                m_redDiff=1;
                 m_redReasonerLoaded=false; m_blueReasonerLoaded=false;
                 scanReasoners();
                 m_menuPhase=1; m_menuSel=0; m_enterClock.Restart(); return;
             }
             if(m_menuSel==0){   // PvP → 直接本机 2 人对战
                 m_aiMode=false; m_bothAI=false; m_diff=1;
-                m_redPlugin=-1; m_bluePlugin=-1;
                 m_redReasonerLoaded=false; m_blueReasonerLoaded=false;
                 m_players=2; m_menuPhase=0; initGame();
                 return;
             }
             // m_menuSel==2: AI Battle → 红方 AI 配置(dat)列表
-            m_redPlugin=-1; m_redDiff=1;
-            m_bluePlugin=-1; m_blueDiff=1;
+            m_redDiff=1; m_blueDiff=1;
             m_redReasonerLoaded=false; m_blueReasonerLoaded=false;
             scanReasoners();
             m_menuPhase=4; m_menuSel=0; m_enterClock.Restart();
@@ -1816,30 +2108,33 @@ private:
             int& curReasoner = (m_menuPhase==6) ? m_blueReasoner : m_redReasoner;
             if((int)m_reasoners.size()==0) return;
             curReasoner = m_menuSel;
-            if(m_menuPhase==1){ m_redPlugin=-1; m_redDiff=1; m_menuPhase=2; m_menuSel=1; m_enterClock.Restart(); }
-            else if(m_menuPhase==4){ m_redPlugin=-1; m_redDiff=1; m_menuPhase=5; m_menuSel=1; m_enterClock.Restart(); }
-            else { m_bluePlugin=-1; m_blueDiff=1; m_menuPhase=7; m_menuSel=1; m_enterClock.Restart(); }
+            if(m_menuPhase==1){ m_redDiff=1; m_menuPhase=2; m_menuSel=1; m_enterClock.Restart(); }
+            else if(m_menuPhase==4){ m_redDiff=1; m_menuPhase=5; m_menuSel=1; m_enterClock.Restart(); }
+            else { m_blueDiff=1; m_menuPhase=7; m_menuSel=1; m_enterClock.Restart(); }
             return;
         }
-        case 2: case 5: case 7: {   // 难度/插件 → 确认并前进
+        case 2: case 5: case 7: {   // 难度 → 确认并前进
             bool isBlue=(m_menuPhase==7);
-            int& plugin = isBlue?m_bluePlugin:m_redPlugin;
             int& diff   = isBlue?m_blueDiff:m_redDiff;
-            if(m_menuSel>=3){ plugin=m_menuSel-3; diff=1; }
-            else { plugin=-1; diff=m_menuSel; }
+            diff=m_menuSel;
             AI& ai = isBlue?m_aiBlue:m_aiRed;
             int reasoner = isBlue?m_blueReasoner:m_redReasoner;
             bool& loaded = isBlue?m_blueReasonerLoaded:m_redReasonerLoaded;
-            if(plugin<0) loadReasonerInto(ai, reasoner, loaded);
+            loadReasonerInto(ai, reasoner, loaded);
             if(m_menuPhase==2){ m_aiMode=true; m_bothAI=false; m_menuPhase=0; initGame(); }
             else if(m_menuPhase==5){ scanReasoners(); m_menuPhase=6; m_menuSel=0; m_enterClock.Restart(); }
-            else { m_aiMode=false; m_bothAI=true; m_menuPhase=0; initGame(); }
+            else {   // AI Battle 开始 → 自我对弈升级模式
+                m_aiMode=false; m_bothAI=true; m_menuPhase=0;
+                m_evolveActive=true; m_evolveDone=0; m_evolveLearnCount=0; m_evolveLastMsg.clear();
+                initGame();
+            }
             return;
         }
         case 8:   // 设置页
             if(m_menuSel==0){ m_menuPhase=9; m_menuSel=m_settings.mapIdx; m_enterClock.Restart(); return; }   // 地图尺寸
             if(m_menuSel==1){ m_menuPhase=10; m_menuSel=0; m_enterClock.Restart(); return; }                   // 保存对局
             if(m_menuSel==2){ m_menuPhase=11; m_menuSel=0; m_enterClock.Restart(); return; }                   // 游戏规则
+            if(m_menuSel==6){ m_menuPhase=14; m_menuSel=0; m_enterClock.Restart(); return; }                   // AI & 进化
             {   // 快捷键开关: 3=B吸附 4=Ctrl+Z撤销 5=R深度
                 bool* b = (m_menuSel==3)?&m_settings.snapEnabled
                        : (m_menuSel==4)?&m_settings.undoEnabled
@@ -1850,6 +2145,8 @@ private:
                 saveSettings();
                 m_enterClock.Restart();
             }
+            return;
+        case 14:  // AI & 进化: 无 Enter 动作, 用 ←/→ 或鼠标 -/+ 调整
             return;
         case 9:   // 分辨率
             m_settings.mapIdx = m_menuSel;
@@ -1881,6 +2178,9 @@ private:
         bool ctrl=(GetKeyState(VK_CONTROL)&0x8000)!=0;
         // 主界面 (菜单)
         if(m_state==State::Menu){
+            // 键盘导航 (方向/Enter/Esc) 时清除鼠标悬停高亮, 避免残留
+            if(vk==VK_UP||vk==VK_DOWN||vk==VK_LEFT||vk==VK_RIGHT||vk==VK_RETURN||vk==VK_ESCAPE)
+                m_menuHover=-1;
             if(vk==VK_ESCAPE){
                 switch(m_menuPhase){
                 case 1: case 4: case 6:   // dat 列表 → 主菜单
@@ -1896,6 +2196,7 @@ private:
                 case 10: m_menuPhase=8; m_menuSel=1; m_enterClock.Restart(); return;
                 case 11: m_menuPhase=8; m_menuSel=2; m_enterClock.Restart(); saveSettings(); return;
                 case 12: m_menuPhase=0; m_menuSel=3; m_enterClock.Restart(); return;
+                case 14: m_menuPhase=8; m_menuSel=6; m_enterClock.Restart(); saveSettings(); return;
                 }
                 return;
             }
@@ -1914,14 +2215,19 @@ private:
                 break;
             }
             case 2: case 5: case 7: {
-                int cnt=3+std::min((int)m_plugins.size(),3);
-                if(vk==VK_DOWN){ m_menuSel=(m_menuSel+1)%cnt; return; }
-                if(vk==VK_UP){ m_menuSel=(m_menuSel+cnt-1)%cnt; return; }
+                if(vk==VK_DOWN){ m_menuSel=(m_menuSel+1)%3; return; }
+                if(vk==VK_UP){ m_menuSel=(m_menuSel+2)%3; return; }
                 break;
             }
             case 8:
-                if(vk==VK_DOWN){ m_menuSel=(m_menuSel+1)%6; return; }
-                if(vk==VK_UP){ m_menuSel=(m_menuSel+5)%6; return; }
+                if(vk==VK_DOWN){ m_menuSel=(m_menuSel+1)%7; return; }
+                if(vk==VK_UP){ m_menuSel=(m_menuSel+6)%7; return; }
+                break;
+            case 14:
+                if(vk==VK_DOWN){ m_menuSel=(m_menuSel+1)%2; return; }
+                if(vk==VK_UP){ m_menuSel=(m_menuSel+1)%2; return; }
+                if(vk==VK_LEFT){ aiEvolveAdjust(m_menuSel,-1); return; }
+                if(vk==VK_RIGHT){ aiEvolveAdjust(m_menuSel,1); return; }
                 break;
             case 9:
                 if(vk==VK_DOWN){ m_menuSel=(m_menuSel+1)%3; return; }
@@ -1958,18 +2264,20 @@ private:
             if(vk==VK_LEFT) { m_repSpeed=std::max(0.5f,m_repSpeed-0.5f); return; }
             if(vk==VK_RIGHT){ m_repSpeed=std::min(5.f,m_repSpeed+0.5f); return; }
             if(vk==VK_RETURN && m_repPaused){ replayStep(); m_repLastTick=GetTickCount64(); return; }  // 单步
-            if(vk==VK_ESCAPE){ m_state=State::Menu; return; }
+            if(vk==VK_ESCAPE){ leaveReplay(); return; }
             return;
         }
         // 结算
         if(m_state==State::GameOver){
             if(vk=='R'&&m_restartClock.GetElapsedTime()>1.5){
+                m_evolveActive=false;   // 手动退出: 停止自我对弈
                 m_state=State::Menu;m_over=false;
             }
             return;
         }
         // 游戏中
         if(vk=='R'&&ctrl){
+            m_evolveActive=false;   // 中断自我对弈
             m_state=State::Menu;m_over=false;return;
         }
         if(m_settings.depthEnabled && vk=='R'&&!ctrl){m_showDepth=!m_showDepth;return;}   // R: 显示/隐藏节点深度
@@ -2027,7 +2335,8 @@ private:
             if(num>=0&&num<=4){
                 int tgt=num+1;
                 if(tgt>=m_reinf->edgeStrength&&tgt<=MAX_S){
-                    int cost=tgt-m_reinf->edgeStrength;
+                    // 允许性判断用实际消耗 (按设置成本, 此前用级数导致 Enter 时才发现买不起)
+                    int cost=(tgt-m_reinf->edgeStrength)*m_settings.reinfCost;
                     if(cost<=sc)m_reinfStr=tgt;
                 }
             }
@@ -2204,7 +2513,7 @@ private:
             Color(255,70,80,140),Color(255,180,60,70));
         g.FillRectangle(&grad,0,0,FULL_W,6);
 
-        textC(g,L"Binary Tree Battle V6.5.0",FULL_W/2.f,170,Color(255,25,25,30),40,true);
+        textC(g,L"Binary Tree Battle V6.6.0",FULL_W/2.f,170,Color(255,25,25,30),40,true);
         textC(g,L"ITERATIVE AI  SELF-LEARNING ENGINE",FULL_W/2.f,215,Color(255,120,120,130),15);
 
         // 装饰线
@@ -2228,7 +2537,7 @@ private:
             // ===== 模式选择 =====
             opt(m_menuSel==0?L"PvP Mode (Two Players)":L"  PvP Mode (Two Players)",430,m_menuSel==0);
             opt(m_menuSel==1?L"vs AI (You = Blue, AI = Red)":L"  vs AI (You = Blue, AI = Red)",474,m_menuSel==1);
-            opt(m_menuSel==2?L"AI Battle (Custom AI vs Custom AI)":L"  AI Battle (Custom AI vs Custom AI)",518,m_menuSel==2);
+            opt(m_menuSel==2?L"AI Battle (Self-Play & Evolve)":L"  AI Battle (Self-Play & Evolve)",518,m_menuSel==2);
             opt(m_menuSel==3?L"Replay (.btb)":L"  Replay (.btb)",562,m_menuSel==3);
             opt(m_menuSel==4?L"Settings":L"  Settings",606,m_menuSel==4);
         }else if(m_menuPhase==8){   // ---- 设置页 ----
@@ -2269,6 +2578,12 @@ private:
                 Color c = on ? Color(255,40,190,70)
                              : (sel ? Color(255,20,20,25) : Color(255,110,110,120));
                 textC(g,s.c_str(),FULL_W/2.f,py,c, sel?17.f:15.f, sel||on);
+            }
+            // AI & 进化 (Enter 进入二级菜单: AI 思考时间 / 自我对弈局数)
+            {
+                std::wstring s = L"AI & Evolution:    [Enter]";
+                textC(g,s.c_str(),FULL_W/2.f,608, m_menuSel==6?Color(255,20,20,25):Color(255,100,100,110),
+                      m_menuSel==6?18.f:16.f, m_menuSel==6);
             }
             textC(g,L"Mouse / Enter: select    Esc: back",FULL_W/2.f,646,Color(255,150,150,158),13);
         }else if(m_menuPhase==11){  // ---- 游戏规则二级菜单 (数值; 鼠标或 ←/→ 调整) ----
@@ -2330,6 +2645,32 @@ private:
                 textC(g,s.c_str(),FULL_W/2.f,py,c, sel?18.f:16.f, sel||on);
             }
             textC(g,L"Enter: toggle    Esc: back",FULL_W/2.f,640,Color(255,150,150,158),13);
+        }else if(m_menuPhase==14){  // ---- AI & 进化二级菜单 (AI 思考时间 / 自我对弈局数) ----
+            textC(g,L"AI & EVOLUTION",FULL_W/2.f,390,Color(255,90,110,140),20,true);
+            drawMenuBackBtn(g);
+            struct{ const wchar_t* name; int* v; } rows[] = {
+                {L"AI Think Time (ms)", &m_settings.aiThinkMs},
+                {L"Self-Play Rounds", &m_settings.evolveRounds},
+            };
+            float py=440;
+            for(int i=0;i<2;++i,py+=50){
+                bool sel=(m_menuSel==i);
+                std::wstring s=rows[i].name;
+                s += L"  :  " + std::to_wstring(*rows[i].v);
+                textC(g,s.c_str(),FULL_W/2.f,py, sel?Color(255,20,20,25):Color(255,110,110,120),
+                      sel?17.f:15.f, sel);
+                // 鼠标 − / + 按钮 (点击调整数值)
+                float bx=FULL_W/2.f+196.f;
+                Color bc = sel ? Color(255,80,110,190) : Color(255,160,160,170);
+                panel(g,bx-14,py-13,28,26, sel?Color(255,230,235,250):Color(255,248,248,248), bc,1.f);
+                textC(g,L"−",bx,py-2,bc,16,true);
+                panel(g,bx+26,py-13,28,26, sel?Color(255,230,235,250):Color(255,248,248,248), bc,1.f);
+                textC(g,L"+",bx+40,py-2,bc,16,true);
+            }
+            textC(g,L"AI Think Time caps each move (50-10000ms = 0.05-10s). Self-Play Rounds: AI Battle auto-plays",FULL_W/2.f,560,Color(255,140,150,165),12);
+            textC(g,L"up to 1000 games and the winner AI learns & mutates to self-upgrade its ai_*.dat.",FULL_W/2.f,582,Color(255,140,150,165),12);
+            textC(g,L"Mouse / ←/→ adjust    Esc: back",FULL_W/2.f,664,
+                  Color(255,150,150,158),12);
         }else if(m_menuPhase==12){  // ---- 回放文件列表 (分页, 每页10个, 含对局信息) ----
             textC(g,L"REPLAY  FILES  (Replays\\)",FULL_W/2.f,392,Color(255,90,110,140),18,true);
             if(m_replays.empty()){
@@ -2397,41 +2738,36 @@ private:
                 }
                 if(cnt>VIS) textC(g,L"… ↑/↓ to browse",FULL_W/2.f,py+4,Color(255,150,150,158),12);
             }
-        }else{   // phases 2,5,7: 难度/插件 (2=vs AI红方, 5=AI Battle红方, 7=AI Battle蓝方)
-            const wchar_t* dTitle = (m_menuPhase==5) ? L"RED  AI  —  Difficulty / Plugin"
-                              : (m_menuPhase==7) ? L"BLUE  AI  —  Difficulty / Plugin"
-                              : L"DIFFICULTY  /  PLUGIN";
+        }else{   // phases 2,5,7: 难度选择 (2=vs AI红方, 5=AI Battle红方, 7=AI Battle蓝方)
+            const wchar_t* dTitle = (m_menuPhase==5) ? L"RED  AI  —  Difficulty"
+                              : (m_menuPhase==7) ? L"BLUE  AI  —  Difficulty"
+                              : L"DIFFICULTY";
             textC(g,dTitle,FULL_W/2.f,392,Color(255,90,110,140),18,true);
             opt(m_menuSel==0?L"EASY  -  AI plays 2nd best":L"  EASY  -  AI plays 2nd best",448,m_menuSel==0);
             opt(m_menuSel==1?L"NORMAL  -  AI plays best":L"  NORMAL  -  AI plays best",478,m_menuSel==1);
             opt(m_menuSel==2?L"HARD  -  Boosted AI":L"  HARD  -  Boosted AI",508,m_menuSel==2);
-            int shown=std::min((int)m_plugins.size(),3);
-            float py=540;
-            for(int i=0;i<shown;++i,py+=32){
-                std::wstring label=L"◆ ";
-                for(char ch : m_plugins[i].name) label+=(wchar_t)ch;
-                if((int)m_plugins[i].name.size()<18 && !m_plugins[i].author.empty()){
-                    label+=L"  (by ";
-                    for(char ch : m_plugins[i].author) label+=(wchar_t)ch;
-                    label+=L")";
-                }
-                std::wstring disp = (m_menuSel==(3+i)) ? label : (L"  "+label);
-                opt(disp.c_str(), py, m_menuSel==(3+i));
-            }
-            if((int)m_plugins.size()>3)
-                textC(g,L"… more plugins in ai_plugins\\",FULL_W/2.f,py+4,Color(255,150,150,158),12);
-            if(m_plugins.empty())
-                textC(g,L"No AI plugins found in ai_plugins\\",FULL_W/2.f,540,Color(255,150,150,158),12);
         }
 
+        // ===== 鼠标悬停"待点击"高亮 (浅色, 区别于选中的蓝框; 仅悬停不选中) =====
+        if(m_menuHover>=0 && m_menuHover!=m_menuSel){
+            float hy;
+            if(menuItemCenterY(m_menuHover, hy)){
+                // 回放列表行较窄, 用居中整行框; 其余菜单项用标准选项框
+                if(m_menuPhase==12){
+                    panel(g,FULL_W/2.f-310,hy-12,620,24,Color(200,245,248,252),Color(255,150,170,215),1.2f);
+                } else {
+                    panel(g,FULL_W/2.f-220,hy-18,440,36,Color(200,246,249,253),Color(255,150,170,215),1.2f);
+                }
+            }
+        }
         // 闪烁 Enter 提示 (设置页与二级菜单不显示; Game Rules 界面不显示)
-        if(m_menuPhase!=8 && m_menuPhase!=9 && m_menuPhase!=10 && m_menuPhase!=11 && m_menuPhase!=12){
+        if(m_menuPhase!=8 && m_menuPhase!=9 && m_menuPhase!=10 && m_menuPhase!=11 && m_menuPhase!=12 && m_menuPhase!=14){
             float a=0.5f+0.5f*std::sin(GetTickCount64()*0.003f);
             Color blink(255,(int)(a*255),(int)(180+a*70),0);
             textC(g,L"Press ENTER to Start",FULL_W/2.f,646,blink,20,true);
         }
         text(g,L"Ctrl+R Restart",FULL_W-150.f,WIN_H-26,Color(255,150,150,150),12);
-        text(g,L"v6.5.0 Win32+GDI+",10,WIN_H-26,Color(255,150,150,150),12);
+        text(g,L"v6.6.0 Win32+GDI+",10,WIN_H-26,Color(255,150,150,150),12);
     }
 
     // ===== 对战渲染 =====
@@ -2447,8 +2783,6 @@ private:
 
         updateHover();
         drawRange(g);
-        drawAIHeat(g);
-        drawPluginHeat(g);
         drawEdges(g);
         drawEdgeInfo(g);
         drawScorePts(g);
@@ -2465,42 +2799,6 @@ private:
                   px+pw/2,py+36,Color(255,220,220,220),12);
             textC(g,L"Branch damage = node attack level",
                   px+pw/2,py+60,Color(255,200,200,210),10);
-        }
-    }
-
-    // 围棋式 AI 选点权重热力图
-    void drawAIHeat(Graphics& g){
-        // 仅在 AI 思考中(未走下一步前)显示实时选点
-        if(!m_aiThinking || !m_thinkingAI) return;
-        auto& cands=m_thinkingAI->heatmap();
-        if(cands.empty()) return;
-        float mn=1e9f,mx=-1e9f;
-        for(auto&c:cands){mn=std::min(mn,c.second);mx=std::max(mx,c.second);}
-        float range=mx-mn; if(range<0.001f)range=1.f;
-        // 蓝(低)→黄(中)→红(高)
-        auto heat=[&](float t)->Color{
-            t=std::max(0.f,std::min(1.f,t));
-            if(t<0.5f){float u=t*2.f; return Color(200,(BYTE)(60+u*120),(BYTE)(150+u*80),(BYTE)(255-u*200));}
-            float u=(t-0.5f)*2.f; return Color(210,(BYTE)(180+u*75),(BYTE)(230-u*140),(BYTE)(55-u*55));
-        };
-        // 标题 + 思考进度
-        int pct=(int)(m_thinkingAI->thinkProgress()*100.f);
-        textC(g, L"AI thinking... " + std::to_wstring(pct) + L"%",
-              WIN_W/2.f, 14, Color(255,120,120,130), 13, true);
-        for(auto&c:cands){
-            float t=(c.second-mn)/range;
-            float rad=7+t*12;
-            Color col=heat(t);
-            SolidBrush br(Color(150,col.GetR(),col.GetG(),col.GetB()));
-            g.FillEllipse(&br,c.first.X-rad,c.first.Y-rad,rad*2,rad*2);
-            Pen pn(Color(220,col.GetR(),col.GetG(),col.GetB()),1.5f);
-            g.DrawEllipse(&pn,c.first.X-rad,c.first.Y-rad,rad*2,rad*2);
-            // 概率百分比
-            int pct2=(int)(t*100.f);
-            if(pct2>=20){ // 只标较显著的
-                std::wstring s=std::to_wstring(pct2)+L"%";
-                textC(g,s,c.first.X,c.first.Y-3,Color(255,30,30,30),10,true);
-            }
         }
     }
 
@@ -2680,13 +2978,13 @@ private:
         }
     }
     void drawScorePts(Graphics& g){
-        // 分数球颜色: 1分=黄 2分=橙 3分=红
+        // 分数球颜色: 1分=黄 2分=橙 3分=品红 (原 3分 红球与红方节点 CLR_RED 颜色过于相似, 改为玫红区分)
         static const Color spFill[4]={
-            CLR_GOLD, Color(255,255,215,0), Color(255,255,140,0), Color(255,235,60,50) };
+            CLR_GOLD, Color(255,255,215,0), Color(255,255,140,0), Color(255,255,40,130) };
         static const Color spGlow[4]={
-            Color(80,255,215,0), Color(80,255,215,0), Color(90,255,150,0), Color(90,255,70,50) };
+            Color(80,255,215,0), Color(80,255,215,0), Color(90,255,150,0), Color(140,255,80,200) };
         static const Color spEdge[4]={
-            CLR_DGOLD, CLR_DGOLD, Color(255,200,90,0), Color(255,180,40,40) };
+            CLR_DGOLD, CLR_DGOLD, Color(255,200,90,0), Color(255,150,20,70) };
         // 脉动
         float phase=0.5f+0.5f*std::sin(GetTickCount64()*0.004);
         for(auto&s:m_scores){
@@ -2762,12 +3060,9 @@ private:
         const wchar_t* cn[4]={L"Red",L"Blue",L"Green",L"Yellow"};
         bool humanTurn = !m_bothAI && !(m_aiMode && idxOfTeam(m_turn)==0);
         auto teamLabel=[&](int ti)->std::wstring{
-            // AI / 插件
-            int pidx = (ti==0)?m_redPlugin:m_bluePlugin;
-            bool plugin = pidx>=0 && pidx<(int)m_plugins.size() && m_plugins[pidx].loaded;
+            // AI
             bool autoSide = m_bothAI || (m_aiMode && ti==0);
             if(autoSide){
-                if(plugin){ std::wstring s=L"[Plugin] "; for(char ch:m_plugins[pidx].name) s+=(wchar_t)ch; return s; }
                 return (ti==0)?L"AI":L"AI Blue";
             }
             return cn[ti];
@@ -2789,14 +3084,12 @@ private:
             Color tc=CLR_TEAMS[i];
             bool isTurn=teamEq(m_turn,CLR_TEAMS[i]);
             float labY=y0+38.f, scoreY=y0+(y1-y0)*0.4f, nodeY=y0+(y1-y0)*0.62f, statY=y0+(y1-y0)*0.8f;
-            // 阵营名 (在线/AI/插件适配)
+            // 阵营名
             std::wstring lbl=teamLabel(i);
-            bool pidxPlug = (i==0)?(m_redPlugin>=0&&m_redPlugin<(int)m_plugins.size()&&m_plugins[m_redPlugin].loaded)
-                                  :(m_bluePlugin>=0&&m_bluePlugin<(int)m_plugins.size()&&m_plugins[m_bluePlugin].loaded);
-            if((m_bothAI||m_aiMode) && i==0 && !pidxPlug)
+            if((m_bothAI||m_aiMode) && i==0)
                 waveText(g,L"AI",cx,labY+8,52,true,0.003f,9.f);
             else
-                textC(g,lbl.c_str(),cx,labY,tc,pidxPlug?20.f:26.f,true,L"Times New Roman");
+                textC(g,lbl.c_str(),cx,labY,tc,26.f,true,L"Times New Roman");
             if(isTurn){ // 回合箭头
                 SolidBrush br(Color(255,40,40,40));
                 PointF pts[3]={{cx-55,labY+10},{cx-65,labY},{cx-45,labY}};
@@ -2820,7 +3113,8 @@ private:
             float pw=360,ph=55,px=(WIN_W-pw)*.5f,py=WIN_H-ph-10;
             panel(g,px,py,pw,ph,Color(220,35,35,40),CLR_GOLD,1.5f);
             SecureInt& sc=scoreOf(m_turn);
-            int cost=m_reinfStr-m_reinf->edgeStrength;
+            // 消耗按设置成本计算 (此前硬编码 1 分/级, 设置改 2/3 分时面板显示/高亮仍按默认)
+            int cost=(m_reinfStr-m_reinf->edgeStrength)*m_settings.reinfCost;
             for(int i=0;i<5;++i){
                 float bx=px+20+i*28.f;
                 int lv=i+1;
@@ -2841,7 +3135,8 @@ private:
         if(m_sel){
             float pw=360,ph=55,px=(WIN_W-pw)*.5f,py=WIN_H-ph-10;
             panel(g,px,py,pw,ph,Color(220,35,35,40),Color(150,150,150,150),1);
-            int cost=m_extend+(m_str-DEF_S);
+            // 消耗按设置成本计算 (此前硬编码 1 分/级, 设置改 2/3 分时面板仍显示默认)
+            int cost=m_extend*m_settings.extendCost+(m_str-DEF_S)*m_settings.reinfCost;
             textC(g,L"Str:"+std::to_wstring(m_str)+L" | Dist:"+
                 std::to_wstring((int)(MAX_D+m_extend*EXTRA_D))+L" | Cost:"+std::to_wstring(cost),
                 px+pw/2,py+16,Color(255,255,255,255),13);
@@ -2864,15 +3159,54 @@ private:
                 + L"  ScorePts " + std::to_wstring(m_settings.maxScorePts);
             text(g, rt.c_str(), 12, WIN_H-8, Color(255,110,120,135), 11, false);
         }
+        // ===== AI 自我对弈进度显示 (AI Battle 模式) =====
+        if(m_bothAI){
+            // 顶部中央: 对局进度 + 学习次数
+            std::wstring prog = L"Self-Play Evolution   Round " + std::to_wstring(m_evolveDone+1)
+                              + L" / " + std::to_wstring(m_settings.evolveRounds)
+                              + L"    |    Learned & Upgraded: " + std::to_wstring(m_evolveLearnCount);
+            textC(g,prog.c_str(),WIN_W/2.f,30,Color(255,70,120,180),15,true);
+            // 最近一次升级提示 (在进度条上方)
+            if(!m_evolveLastMsg.empty()){
+                textC(g,m_evolveLastMsg.c_str(),WIN_W/2.f,52,Color(255,140,150,165),12,false);
+            }
+            // 进度条
+            float bw=WIN_W-200.f, bx=100.f, by=70.f, bh=8.f;
+            float pct = (float)m_evolveDone / std::max(1,m_settings.evolveRounds);
+            SolidBrush bg(Color(255,220,224,230));
+            g.FillRectangle(&bg,bx,by,bw,bh);
+            if(pct>0){
+                SolidBrush fill(Color(255,60,160,220));
+                g.FillRectangle(&fill,bx,by,bw*pct,bh);
+            }
+            Pen pbr(Color(180,190,200,210)); g.DrawRectangle(&pbr,bx,by,bw,bh);
+        }
     }
     void drawOverlay(Graphics& g){
         float el=m_restartClock.GetElapsedTime();
         if(el<0.5f)return;
         SolidBrush bg(Color(170,0,0,0));
         g.FillRectangle(&bg,0,0,WIN_W,WIN_H);
-        textC(g,m_winner+L" WINS!",WIN_W/2.f,WIN_H/2.f-30,CLR_GOLD,46,true);
-        if(el>2.f){
-            textC(g,L"Press R to Menu   (Replay auto-saved)",WIN_W/2.f,WIN_H/2.f+30,Color(255,200,200,200),20);
+        if(m_bothAI){
+            // AI 自我对弈: 显示本局结果 + 对弈进度 (自动续局)
+            textC(g,m_winner+L" WINS!",WIN_W/2.f,WIN_H/2.f-40,CLR_GOLD,40,true);
+            std::wstring prog = L"Round " + std::to_wstring(m_evolveDone) + L" / "
+                              + std::to_wstring(m_settings.evolveRounds)
+                              + L"    |    Learned & Upgraded: " + std::to_wstring(m_evolveLearnCount);
+            textC(g,prog.c_str(),WIN_W/2.f,WIN_H/2.f+10,Color(255,220,230,245),18,true);
+            if(!m_evolveLastMsg.empty())
+                textC(g,m_evolveLastMsg.c_str(),WIN_W/2.f,WIN_H/2.f+40,Color(255,180,200,230),14,false);
+            if(m_evolveDone >= m_settings.evolveRounds){
+                textC(g,L"Evolution complete! Press R to Menu",WIN_W/2.f,WIN_H/2.f+75,
+                      Color(255,120,255,120),18,true);
+            } else {
+                textC(g,L"Next round starting...",WIN_W/2.f,WIN_H/2.f+75,Color(255,200,200,200),15,false);
+            }
+        } else {
+            textC(g,m_winner+L" WINS!",WIN_W/2.f,WIN_H/2.f-30,CLR_GOLD,46,true);
+            if(el>2.f){
+                textC(g,L"Press R to Menu   (Replay auto-saved)",WIN_W/2.f,WIN_H/2.f+30,Color(255,200,200,200),20);
+            }
         }
     }
 
@@ -2897,6 +3231,20 @@ private:
     Node* myRoot(){ return rootOf(idxOfTeam(m_turn)); }
     SecureInt& scoreOfTeam(int i){ return m_plyScores[i]; }
     void advanceTurn(){                       // 切换到下一个存活阵营
+        // 全局回合上限兜底: AI 对局超过 300 回合仍无胜负 → 强制判平, 防止任何死循环
+        if(m_bothAI || m_aiMode){
+            m_totalTurns++;
+            if(m_totalTurns>=300 && !m_over){
+                m_over = true;
+                m_winner = L"Nobody";
+                m_state = State::GameOver;
+                m_restartClock.Restart();
+                m_evolveLastMsg = L"Round "+std::to_wstring(m_evolveDone+1)
+                                +L": MAX TURNS (300) — forced draw";
+                checkVictory();   // 走正常结算: 保存录像 + 自我对弈计数
+                return;
+            }
+        }
         int n=m_players;
         for(int s=1;s<=n;++s){
             int k=(idxOfTeam(m_turn)+s)%n;
@@ -2918,6 +3266,7 @@ private:
     std::vector<ReplayAction> m_replay;   // 对局行动记录
     int m_replayTurn = 0;                 // 当前记录回合
     bool m_replaySaved = false;           // 本局已自动保存
+    int m_nextRid = 2;                    // 下一个节点 ID (0=红根 1=蓝根, 新分支递增)
     // 回放状态
     std::vector<ReplayAction> m_repActs;  // 回放行动序列
     int m_repIdx = 0;                     // 当前回放索引
@@ -2931,6 +3280,10 @@ private:
     static constexpr int REP_PAGE=10;     // 回放列表每页条数
     int m_repRs=10, m_repBs=10, m_repGs=10, m_repYs=10;   // 回放初始分数 (V6.2.0: 4 方)
     int m_repPlayers=2;                    // 回放玩家数
+    int m_repMapW=0, m_repMapH=0;          // BTBDT3: 回放记录的地图尺寸 (0=旧文件, 沿用当前窗口)
+    bool m_repUseAff=false;                // BTBDT3: 分支攻击效果精确记录 (空 aff=无效果, 不重算几何)
+    int m_repSaveW=0, m_repSaveH=0;        // 回放期间保存的现场地图尺寸 (退出时恢复)
+    bool m_suppressAutoSave=false;         // 自测模式抑制 checkVictory 自动保存
     std::string m_repWinner="red";        // 回放胜者
     std::vector<ReplayScorePt> m_repScores;      // 回放开局黄点布局 ([S] 段)
     ReplayScoreStats m_repStats;                 // 回放黄点实时统计
@@ -2940,14 +3293,21 @@ private:
     std::vector<ScorePoint> m_scores;
 
     bool m_aiExtraPending = false;   // AI 额外行动尝试中 (第二次思考待评估)
+    int  m_aiMoveRejected = 0;       // 本局 AI 行动因积分不足被拒次数 (成本模型一致性诊断)
     Node* m_nodeMenu = nullptr;        // 右键节点操作面板 (删除)
     bool m_showDepth = false;          // R键: 显示节点深度 (根=0)
     bool m_over=false; std::wstring m_winner;
+    // ===== AI 自我对弈 (自我升级工具) =====
+    bool m_evolveActive = false;       // 自我对弈进行中 (AI Battle 模式)
+    int  m_evolveDone = 0;             // 已完成对局数
+    int  m_evolveLearnCount = 0;       // 已学习升级次数
+    std::wstring m_evolveLastMsg;      // 最近一次升级提示
+    // ===== AI 死循环检测: 同一方连续 >=3 回合下到相同点位 → 强制结束本局 =====
+    PointF m_lastMoveTgt[4];           // 各方最近一次落点
+    int    m_sameMoveCount[4] = {0,0,0,0};
+    int    m_totalTurns = 0;           // 当前对局总回合数 (全局回合上限兜底防死循环)
     std::mt19937 m_rng;
     AI m_aiRed, m_aiBlue;
-    std::vector<AIPlugin> m_plugins;   // 已加载的 AI 插件 (ai_plugins\*.dll)
-    int  m_redPlugin = -1;             // 红方 AI 插件索引 (-1=内置)
-    int  m_bluePlugin = -1;            // 蓝方 AI 插件索引 (-1=内置)
     int  m_redDiff = 1;                // 红方内置难度 0/1/2
     int  m_blueDiff = 1;               // 蓝方内置难度 0/1/2
     std::vector<std::string> m_reasoners;   // 已发现的 ai_reasoner_XXXX.dat 文件名(按编号排序)
@@ -2955,14 +3315,10 @@ private:
     int  m_blueReasoner = 0;           // 蓝方选中的 reasoner 索引
     bool m_redReasonerLoaded = false;  // 本局红方是否已加载 reasoner (退出时回写)
     bool m_blueReasonerLoaded = false; // 本局蓝方是否已加载 reasoner
-    static constexpr ULONGLONG PLUGIN_TURN_MS = 900;  // 插件每回合最小间隔(ms)
-    int  m_pluginWaitTeam = -1;        // 正在等待的插件回合方 (-1=无)
-    ULONGLONG m_pluginTurnStart = 0;   // 该插件回合开始时刻
-    std::vector<AIPluginCand> m_pluginCands;    // 插件上报的候选落点(热力图)
-    bool m_pluginCandsValid = false;   // 当前候选是否已从插件拉取
     bool m_aiMode=false;
     bool m_bothAI=false;
     int m_menuSel=0;
+    int m_menuHover=-1;  // 鼠标悬停项 (仅待点击高亮, 不选中; -1=无)
     int m_menuPhase=0;   // 0=模式 1/4/6=dat列表 2/5/7=难度插件 8=设置 9=分辨率 10=保存对局 11=游戏规则 12=回放列表
     int m_diff=1;   // AI 难度: 0简单 1普通 2困难
     // 迭代思考状态 (选点动画)
@@ -2991,6 +3347,9 @@ private:
         // V6.3.1: 节点攻击力 (攻击增强)
         int attackMax = 5;            // 节点攻击力上限 (1..5)
         int attackCost= 1;            // 每提升 1 级攻击力消耗的积分 (0..3)
+        // V6.5.0: AI 思考时间限制 + 自我对弈局数
+        int aiThinkMs = 50;           // AI 每回合思考时间上限 (毫秒, 50~10000, 0.05s~10s)
+        int evolveRounds = 20;        // AI 自我对弈局数 (5~1000)
     } m_settings;
     // 已取消 1280x1024 / 1920x1080, 仅保留 3 档: 1000x700 / 1280x720 / 1600x900
     static inline const int kMapW[3] = {1000,1280,1600};
@@ -3021,6 +3380,8 @@ private:
                     else if(!strcmp(k,"init_score_pts")) m_settings.initScorePts = atoi(s);
                     else if(!strcmp(k,"attack_max"))  m_settings.attackMax = atoi(s);
                     else if(!strcmp(k,"attack_cost")) m_settings.attackCost = atoi(s);
+                    else if(!strcmp(k,"ai_think_ms")) m_settings.aiThinkMs = atoi(s);
+                    else if(!strcmp(k,"evolve_rounds")) m_settings.evolveRounds = atoi(s);
                 }
             }
             fclose(f);
@@ -3048,6 +3409,8 @@ private:
         fprintf(f,"init_score_pts=%d\n",m_settings.initScorePts);
         fprintf(f,"attack_max=%d\n",m_settings.attackMax);
         fprintf(f,"attack_cost=%d\n",m_settings.attackCost);
+        fprintf(f,"ai_think_ms=%d\n",m_settings.aiThinkMs);
+        fprintf(f,"evolve_rounds=%d\n",m_settings.evolveRounds);
         fclose(f);
     }
     void applyMapSize(){        // 更新全局地图尺寸并调整窗口 (居中显示)
@@ -3082,6 +3445,11 @@ private:
 
 // ===== 入口 =====
 int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int){
+    // 无头自检模式: 不创建窗口, 驱动 AI 对弈并验证回放一致性
+    for(int i=1;i<__argc;++i)
+        if(_stricmp(__argv[i],"--selftest")==0){
+            return Game::I().runSelfTest();
+        }
     if(!Game::I().init(hInst))return 1;
     return Game::I().run();
 }

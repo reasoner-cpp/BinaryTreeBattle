@@ -10,22 +10,14 @@ if(MSVC)
 endif()
 
 # Win32 + GDI+ 版本 —— 仅依赖 Windows 系统自带库
-add_executable(BinaryTreeBattle WIN32 src/main.cpp src/ai.cpp src/ai_plugin_host.cpp)
+add_executable(BinaryTreeBattle WIN32 src/main.cpp src/ai.cpp)
 
 # 自我对弈强度评估器
 add_executable(selfplay2 src/selfplay2.cpp src/ai.cpp)
 
-# 示例 AI 插件 (编译为 DLL, 输出到 <构建目录>/ai_plugins/)
-add_library(sample_ai SHARED src/sample_plugin.cpp)
-target_compile_definitions(sample_ai PRIVATE AI_PLUGIN_BUILD)
-set_target_properties(sample_ai PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/ai_plugins"
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/ai_plugins")
-
 if(MSVC)
     target_compile_options(BinaryTreeBattle PRIVATE /utf-8)
     target_compile_options(selfplay2 PRIVATE /utf-8)
-    target_compile_options(sample_ai PRIVATE /utf-8)
 endif()
 
 # Windows 系统自带库 (仅依赖系统自带, 无需第三方)

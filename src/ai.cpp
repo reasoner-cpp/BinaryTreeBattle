@@ -45,6 +45,7 @@ struct SimState {
         std::vector<ScorePoint> scores;
         int scoreMy = 0, scoreEn = 0;
         std::map<Node*, Node*> nodeMap;           // 原→克隆
+        int extendCost = 1, reinfCost = 1;        // 游戏规则成本 (AI setRules 传入)
     };
     inline bool isRedC(const Color& c) { return sameColor(c, Color(255, 220, 53, 69)); }
 
@@ -93,6 +94,7 @@ struct SimState {
         if (c.enRoot && c.enRoot != c.myRoot) collect(c.enRoot);
         c.scores = src.scores;
         c.scoreMy = src.scoreMy; c.scoreEn = src.scoreEn;
+        c.extendCost = src.extendCost; c.reinfCost = src.reinfCost;
         return c;
     }
 
@@ -146,7 +148,7 @@ struct SimState {
     }
     bool simApplyMove(SimState& st, Node* parent, PointF tgt, int str, int ext, const Color& team) {
         int& sc = isRedC(team) ? st.scoreMy : st.scoreEn;
-        int cost = ext + (str - 1);
+        int cost = ext*st.extendCost + (str - 1)*st.reinfCost;   // 与主游戏规则一致
         if (cost > sc) return false;
         sc -= cost;
         auto nd = std::make_unique<Node>();
@@ -187,18 +189,18 @@ bool AI::findKillMove(const std::vector<Node*>& nodes, Node* myRoot, Node* enemy
                       int myScore, const std::vector<ScorePoint>& scores,
                       const Color& myTeam, Move& out) {
     (void)myRoot; (void)scores;
-    int reserve = computeReserve(myScore, (int)nodes.size());
-    int spendable = std::max(0, myScore - reserve);
+    // 杀根即终局, 允许使用全部积分 (不再预留 reserve 保底)
+    int spendable = std::max(0, myScore);
     for (auto* n : nodes) {
         if (!sameColor(n->team, myTeam) || n->children.size() >= 2) continue;
         PointF dir{enemyRoot->pos.X - n->pos.X, enemyRoot->pos.Y - n->pos.Y};
         float L = std::sqrt(dir.X * dir.X + dir.Y * dir.Y);
-        if (L < 25.f || L > MAX_D + 3 * EXTRA_D) continue;
+        if (L < 25.f || L > maxReach()) continue;
         dir.X /= L; dir.Y /= L;
         // 根后方落点 (分支穿过根), 多试几个偏移
         for (float extra : {15.f, 30.f, 45.f, 60.f}) {
             float dist = L + extra;
-            if (dist > MAX_D + 3 * EXTRA_D) continue;
+            if (dist > maxReach()) continue;
             PointF tgt{n->pos.X + dir.X * dist, n->pos.Y + dir.Y * dist};
             if (tgt.X < 25.f || tgt.X > WIN_W - 25.f || tgt.Y < 25.f || tgt.Y > WIN_H - 25.f) continue;
             bool occ = false;
@@ -206,8 +208,9 @@ bool AI::findKillMove(const std::vector<Node*>& nodes, Node* myRoot, Node* enemy
                 if (o != n && len2(o->pos, tgt) < OCCUPY_R) { occ = true; break; }
             if (occ) continue;
             int ext = 0;
-            if (dist > MAX_D) { ext = (int)std::ceil((dist - MAX_D) / EXTRA_D); if (ext > 3) ext = 3; }
-            if (ext > spendable) continue;   // 积分预算内
+            if (dist > MAX_D) { ext = (int)std::ceil((dist - MAX_D) / EXTRA_D); if (ext > m_extendMax) ext = m_extendMax; }
+            // 杀根即终局, 允许花光全部积分; 扩展成本按规则 extendCost 计算
+            if (ext*m_extendCost > spendable) continue;   // 积分预算内
             if (ptSegDist(enemyRoot->pos, n->pos, tgt) < NODE_R + ATK_M) {
                 out.parent = n; out.target = tgt; out.strength = DEF_STR;
                 out.extend = ext; out.score = 1e9f;
@@ -555,6 +558,29 @@ bool AI::loadFromFile(const char* path) {
     return true;
 }
 
+// ===== 自我对弈进化 (参数突变) =====
+void AI::seedRandom(unsigned s){ m_rng.seed(s ? s : 42); }
+void AI::mutate(float rate){
+    if(rate<=0.f) return;
+    auto factor=[&](){ return 1.f + ((float)(m_rng()%2001)-1000.f)/1000.f*rate; };
+#define MUT(n, lo, hi) { m_cfg.n *= factor(); m_cfg.n = std::max((lo), std::min((hi), m_cfg.n)); }
+    MUT(nodeHit,   10.f, 800.f); MUT(hubFactor, 10.f, 400.f);
+    MUT(edgeKill,   5.f, 250.f); MUT(edgeHit,    2.f, 120.f);
+    MUT(decisive2, 20.f, 600.f); MUT(combo,      5.f, 150.f);
+    MUT(strBonus,   2.f, 100.f); MUT(advance,   0.5f,  15.f);
+    MUT(collect,   10.f, 300.f); MUT(collectLow, 5.f, 300.f);
+    MUT(expand,   0.05f,   3.f); MUT(center,   0.02f,   1.f);
+    MUT(defense,   0.2f,   8.f);
+    MUT(reserveBase,0.5f, 10.f); MUT(spendOpen,  2.f, 100.f);
+    MUT(spendMid,   1.f,  40.f); MUT(spendTight, 1.f,  35.f);
+    MUT(extraThresh,100.f,1200.f); MUT(threatMul,0.5f,   4.f);
+    MUT(reinfBudget,0.1f,  1.f); MUT(reinfThreat,5.f,  80.f);
+    MUT(sprintDist,100.f,500.f); MUT(sprintBonus,0.5f,   6.f);
+    MUT(extraSprint,80.f,400.f); MUT(deepPush, 200.f, 700.f);
+    MUT(hubPreference,0.5f,3.f); MUT(riskTaker, 0.6f, 2.f);
+#undef MUT
+}
+
 // ===== 前向威胁检查 =====
 float AI::threatPenalty(const std::vector<Node*>& nodes, Node* myRoot, Node* enemyRoot,
                         const Color& enemyTeam, Node* parent, PointF tgt) {
@@ -569,7 +595,7 @@ float AI::threatPenalty(const std::vector<Node*>& nodes, Node* myRoot, Node* ene
     for (auto* e : nodes) {
         if (!sameColor(e->team, enemyTeam) || e->children.size() >= 2) continue;
         float d = len2(e->pos, tgt);
-        if (d < 20.f || d > MAX_D + 3 * EXTRA_D) continue;
+        if (d < 20.f || d > maxReach()) continue;
         int neededExt = (d > MAX_D) ? (int)std::ceil((d - MAX_D) / EXTRA_D) : 0;
         if (neededExt > 2) continue;
         bool blocked = false;
@@ -633,6 +659,10 @@ float AI::scoreTarget(Node* parent, PointF tgt, int str, int ext,
     if (m_sit.enScore > m_sit.myScore) dynCol *= 1.8f;
     // 己方积分充裕但敌方更多 → 也倾向收集 (保持资源领先)
     if (m_sit.myScore < 10 && m_sit.enScore >= 8) dynCol *= 1.5f;
+    // ===== 己方积分落后 → 收紧进攻(少烧分) + 更重收集 (对局败因: 红方 15 分烧到 0, 玩家持续收集) =====
+    if (m_sit.myScore < m_sit.enScore) { dynCol *= 1.6f; dynAtk *= 0.85f; }
+    // 己方已破产(≤2分) → 严禁烧分进攻, 全力收集/免费防御
+    if (m_sit.myScore <= 2) dynAtk *= 0.55f;
     // ===== 换位思考: 我方防线暴露于玩家 → 抑制冒进进攻, 优先补防 =====
     if (m_sit.myWeakEdges >= 2) dynAtk *= 0.85f;
     if (m_sit.myWeakEdges >= 4) dynAtk *= 0.7f;
@@ -678,7 +708,7 @@ float AI::scoreTarget(Node* parent, PointF tgt, int str, int ext,
     }
 
     float s = 0.5f + learnDirBonus;
-    int cost = ext + (str - DEF_STR);
+    int cost = ext*m_extendCost + (str - DEF_STR)*m_reinfCost;   // 与主游戏规则一致
     PointF src = parent->pos;
 
     // 绕后补防: 候选落子若在缺口扇区方向建立防线 → 防守奖励
@@ -709,7 +739,9 @@ float AI::scoreTarget(Node* parent, PointF tgt, int str, int ext,
             collected = true;
             collectValue += sp.value;
             s += sp.value * ((spendMult > 3.f) ? m_cfg.collectLow : m_cfg.collect) * dynCol;
-            s += sp.value * 5.f;   // 黄点未来积分现值 (鼓励从母节点收集)
+            // 黄点未来积分现值 (分落后时更高: 收集是翻盘的唯一途径 — 对局败因: 红方从不收集)
+            float present = (m_sit.myScore < m_sit.enScore || m_sit.myScore < 6) ? 12.f : 5.f;
+            s += sp.value * present;
         }
     // 收集经济性: 花 ext 延长去够黄点必须物有所值 (黄点值 ≥ 扩展花费)
     if (ext > 0 && collected && collectValue < (float)ext)
@@ -743,19 +775,26 @@ float AI::scoreTarget(Node* parent, PointF tgt, int str, int ext,
     s += edgesDead * m_cfg.edgeKill * atk * dynAtk;
     s += (edgesHit - edgesDead) * m_cfg.edgeHit * dynAtk;
 
-    // 从根节点开新枝: 若无战果则惩罚 (鼓励从已有前线节点深化推进)
+    // 从根节点开新枝 = 建立第二棵子树 (单链被切即整链全灭, 鼓励分叉备份)
     if (parent->parent == nullptr && parent->children.size() >= 1) {
         if (nodesHit == 0 && edgesHit == 0 && !collected)
-            s -= 15.f;
+            s -= 5.f;    // 原 -15: 放宽纯扩张惩罚 (分叉是必要的结构备份)
+        else
+            s += 10.f;   // 有战果/收集的第二枝价值更高
     }
-    // 从已有子节点深化: 轻微奖励
+    // 从已有子节点深化: 仅当该枝不是唯一前线时奖励 (降低单链深化的无脑奖励)
     else if (parent->parent != nullptr) {
-        s += 4.f;
+        s += 2.f;        // 原 +4
     }
 
     // 扩展距离效率: 无任何战果(无命中/穿越/收集)的扩展重罚, 避免滥用积分
-    if (ext > 0 && nodesHit == 0 && edgesHit == 0 && !collected)
-        s -= ext * 10.f * spendMult;
+    // 开局(节点少)重罚大步扩展: 对局败因 — 红方开局连烧 10 分大步推进, 中盘直接破产
+    {
+        float extPen = 10.f * spendMult;
+        if (m_sit.myNodes < 4 || (int)nodes.size() < 8) extPen *= 2.5f;
+        if (ext > 0 && nodesHit == 0 && edgesHit == 0 && !collected)
+            s -= ext * extPen;
+    }
 
     int kills = nodesHit + edgesDead;
     if (kills >= 2) s += m_cfg.decisive2 * dynAtk;
@@ -821,7 +860,17 @@ float AI::scoreTarget(Node* parent, PointF tgt, int str, int ext,
     }
     s -= parentRisk * dynDef;
 
-    if (m_lastTarget.X > 0) s += len2(tgt, m_lastTarget) * 0.02f;
+    // ===== 位置记忆: 曾被敌方摧毁的己方节点位置附近 = 危险重建区, 重罚 =====
+    // (对局败因: AI 0 分时反复下到同一被摧毁位置, 被玩家反打)
+    for (auto& k : m_killedTargets)
+        if (len2(tgt, k) < 45.f) s -= 90.f;
+
+    // 与上次落点重叠 → 敌方已布防/可反打, 重罚; 否则延续攻势 (微奖励)
+    if (m_lastTarget.X > 0) {
+        float dLast = len2(tgt, m_lastTarget);
+        if (dLast < OCCUPY_R) s -= 70.f;
+        else s += dLast * 0.02f;
+    }
 
     if (m_turnsWithoutBranch >= 3) {
         s *= 1.25f;
@@ -857,7 +906,7 @@ void AI::genTargets(Node* parent, Node* myRoot, Node* enemyRoot,
         if (sameColor(n->team, myTeam)) continue;
         PointF d = n->pos - parent->pos;
         float L = std::sqrt(d.X * d.X + d.Y * d.Y);
-        if (L < 25.f || L > MAX_D + 3 * EXTRA_D + 20.f) continue;
+        if (L < 25.f || L > maxReach() + 20.f) continue;
         d.X /= L; d.Y /= L;
         out.push_back(n->pos);
         for (float off : {-30.f, 30.f, -45.f, 45.f, -70.f, 70.f})
@@ -870,14 +919,14 @@ void AI::genTargets(Node* parent, Node* myRoot, Node* enemyRoot,
         if (n->parent == nullptr) continue;
         PointF mid = {(n->pos.X + enemyRoot->pos.X) * 0.5f,
                       (n->pos.Y + enemyRoot->pos.Y) * 0.5f};
-        if (len2(mid, parent->pos) > 30.f && len2(mid, parent->pos) < MAX_D + 3 * EXTRA_D)
+        if (len2(mid, parent->pos) > 30.f && len2(mid, parent->pos) < maxReach())
             out.push_back(mid);
     }
     for (auto& sp : scores) {
         if (!sp.alive) continue;
         PointF dsp = sp.pos - parent->pos;
         float Lsp = std::sqrt(dsp.X * dsp.X + dsp.Y * dsp.Y);
-        if (Lsp < 18.f || Lsp > MAX_D + 3 * EXTRA_D) continue;   // 放宽近距, 母节点可收集
+        if (Lsp < 18.f || Lsp > maxReach()) continue;   // 放宽近距, 母节点可收集
         out.push_back(sp.pos);
         if (Lsp > 1.f) {
             PointF ud{dsp.X / Lsp, dsp.Y / Lsp};
@@ -928,15 +977,15 @@ void AI::evaluateNode(Node* n, const std::vector<Node*>& nodes, Node* myRoot,
     for (auto& t : targets) {
         if (t.X < 25 || t.X > WIN_W - 25 || t.Y < 25 || t.Y > WIN_H - 25) continue;
         float dist = len2(n->pos, t);
-        if (dist < 20 || dist > MAX_D + 3 * EXTRA_D) continue;
+        if (dist < 20 || dist > maxReach()) continue;
         bool occ = false;
         for (auto* o : nodes)
             if (o != n && len2(o->pos, t) < OCCUPY_R) { occ = true; break; }
         if (occ) continue;
         int ext = 0;
-        if (dist > MAX_D) { ext = (int)std::ceil((dist - MAX_D) / EXTRA_D); if (ext > 3) ext = 3; }
+        if (dist > MAX_D) { ext = (int)std::ceil((dist - MAX_D) / EXTRA_D); if (ext > m_extendMax) ext = m_extendMax; }
         for (int str = DEF_STR; str <= MAX_STR; ++str) {
-            int cost = ext + (str - DEF_STR);
+            int cost = ext*m_extendCost + (str - DEF_STR)*m_reinfCost;
             if (cost > spendable) break;
             float s = scoreTarget(n, t, str, ext, nodes, myRoot, enemyRoot, scores, myTeam, spendMult);
             m_allCands.push_back({s, n, t, str, ext});
@@ -948,26 +997,14 @@ void AI::evaluateNode(Node* n, const std::vector<Node*>& nodes, Node* myRoot,
     }
 }
 
-void AI::updateHeatmap() {
-    if (m_allCands.empty()) { m_lastCands.clear(); return; }
-    std::sort(m_allCands.begin(), m_allCands.end(),
-        [](auto& a, auto& b) { return a.score > b.score; });
-    m_lastCands.clear();
-    int nShow = std::min((int)m_allCands.size(), 15);
-    for (int i = 0; i < nShow; ++i)
-        m_lastCands.push_back({m_allCands[i].tgt, m_allCands[i].score});
-}
-
 void AI::finalizeBest(const std::vector<Node*>& nodes, Node* myRoot, Node* enemyRoot,
                       int myScore, int enScore, const std::vector<ScorePoint>& scores,
                       const Color& myTeam) {
-    // 强制杀根: 积分预算内可一步命中敌根 → 直接取胜 (简单难度不启用, 留机会给玩家)
-    if (m_difficulty != 0) {
+    // 强制杀根: 积分预算内可一步命中敌根 → 直接取胜 (任何难度都执行, 一击必杀时必须击杀对方)
+    {
         Move killMove;
         if (findKillMove(nodes, myRoot, enemyRoot, myScore, scores, myTeam, killMove)) {
             m_best = killMove;
-            m_lastCands.clear();
-            m_lastCands.push_back({killMove.target, killMove.score});
             return;
         }
     }
@@ -991,6 +1028,7 @@ void AI::finalizeBest(const std::vector<Node*>& nodes, Node* myRoot, Node* enemy
         int abDepth = (m_difficulty==0) ? 2 : (m_difficulty==2 ? 4 : 3);
         int abBranch = (m_difficulty==2) ? 5 : AB_BRANCH;
         SimState root = cloneGame(nodes, myRoot, enemyRoot, scores, myScore, enScore, myTeam);
+        root.extendCost = m_extendCost; root.reinfCost = m_reinfCost;   // 游戏规则成本
         int K = std::min((int)m_allCands.size(), abBranch + 2);
         for (int i = 0; i < K; ++i) {
             auto& c = m_allCands[i];
@@ -1015,11 +1053,6 @@ void AI::finalizeBest(const std::vector<Node*>& nodes, Node* myRoot, Node* enemy
     m_best.strength = m_allCands[pick].str;
     m_best.extend = m_allCands[pick].ext;
     m_best.score = m_allCands[pick].score;
-    // 更新热力图 (最终含威胁+模拟)
-    m_lastCands.clear();
-    int nShow = std::min((int)m_allCands.size(), 15);
-    for (int i = 0; i < nShow; ++i)
-        m_lastCands.push_back({m_allCands[i].tgt, m_allCands[i].score});
 }
 
 // ===== 迭代思考 =====
@@ -1030,6 +1063,27 @@ void AI::beginThink(const std::vector<Node*>& nodes, Node* myRoot, Node* enemyRo
     // 防御: 根缺失(游戏应已结束)时不思考, 让调用方正常收尾
     if (!myRoot || !enemyRoot) { m_thinking = false; m_best = Move{}; return; }
     m_sit = analyzeSituation(nodes, myRoot, enemyRoot, myScore, enScore, scores);
+    // ===== 位置记忆: 对比上次局面, 记录被敌方摧毁的己方节点位置 (重建落点重罚) =====
+    {
+        std::vector<PointF> cur;
+        for (auto* n : nodes)
+            if (sameColor(n->team, myRoot->team)) cur.push_back(n->pos);
+        if (!m_prevMyNodes.empty()) {
+            for (auto& p : m_prevMyNodes) {
+                bool alive = false;
+                for (auto& q : cur)
+                    if (len2(p, q) < 1.f) { alive = true; break; }
+                if (!alive) {
+                    bool dup = false;
+                    for (auto& k : m_killedTargets)
+                        if (len2(k, p) < 40.f) { dup = true; break; }
+                    if (!dup) m_killedTargets.push_back(p);
+                }
+            }
+            while (m_killedTargets.size() > 8) m_killedTargets.erase(m_killedTargets.begin());
+        }
+        m_prevMyNodes = cur;
+    }
     m_expandables.clear();
     for (auto* n : nodes)
         if (sameColor(n->team, myRoot->team) && n->children.size() < 2)
@@ -1058,7 +1112,6 @@ bool AI::thinkStep(const std::vector<Node*>& nodes, Node* myRoot, Node* enemyRoo
         evaluateNode(m_expandables[idx], nodes, myRoot, enemyRoot, myScore, scores, myTeam);
     }
     m_iter++;
-    updateHeatmap();
     if (m_iter >= m_maxIter || idx >= (int)m_expandables.size() - 1) {
         finalizeBest(nodes, myRoot, enemyRoot, myScore, enScore, scores, myTeam);
         if (m_best.parent) {
@@ -1097,7 +1150,9 @@ void AI::reinforce(std::vector<Node*>& nodes, int& myScore, int enScore, const C
                     upFactor = 0.4f;
                 float threat = (range - minDist) * (5 - c->edgeStrength)
                              * (0.2f + val * 0.6f) * upFactor;
-                int maxUp = std::min(MAX_STR - c->edgeStrength, myScore);
+                // 积分可买级数 (按规则成本; 成本0=免费, 可升满)
+                int maxLv = m_reinfCost>0 ? myScore/m_reinfCost : 100;
+                int maxUp = std::min(MAX_STR - c->edgeStrength, maxLv);
                 if (maxUp > 0) cands.push_back({c.get(), threat, maxUp});
             }
         }
@@ -1111,38 +1166,54 @@ void AI::reinforce(std::vector<Node*>& nodes, int& myScore, int enScore, const C
     int reserve = computeReserve(myScore, (int)nodes.size());
     int budget = (myNodeCount < 4) ? 0 : std::max(0, myScore - reserve - 1);
     // 敌方积分充足 → 提高防守预算, 加固关键边 (防强攻/绕后)
-    if (enScore >= 8) budget = std::max(budget, std::max(0, myScore - reserve));
-    if (enScore >= 12) budget = std::max(budget, std::max(0, myScore - reserve + 1));
+    // 注意: 仅节点数足够时生效 — 开局(节点少)无防线可强化, 强行拉高预算会烧掉积分
+    if (myNodeCount >= 4) {
+        if (enScore >= 8) budget = std::max(budget, std::max(0, myScore - reserve));
+        if (enScore >= 12) budget = std::max(budget, std::max(0, myScore - reserve + 1));
+    }
     // 主动防御: 存在高威胁薄弱边时, 即使积分紧张也强制留防御预算
     if (!cands.empty()) {
         if (cands[0].threat > 40.f) budget = std::max(budget, 1);
         if (cands[0].threat > 90.f) budget = std::max(budget, 2);
     }
-    // 预算绝不允许超过剩余分数 (防止扣成负值导致无法行动)
-    budget = std::min(budget, std::max(0, myScore));
-    // 每条边至少 +1 (若预算够), 让更多薄弱边得到基础加固
+    // ===== 预算纪律: 防止积分破产 (对局败因: 15 分烧到 0) =====
+    // 保底 = max(2, 单级最贵成本): 保证强化后下回合至少买得起一次最小付费行动
+    int floorScore = std::max(2, std::max(m_extendCost, std::max(m_reinfCost, m_attackCost)));
+    budget = std::min(budget, std::max(0, myScore - floorScore));
+    // 每条边至少 +1 (若预算够), 让更多薄弱边得到基础加固 (成本按规则 reinfCost)
+    // 成本 >1 时每条边每回合最多强化 1 级 (避免单边豪赌)
     int count = 0;
     for (auto& cd : cands) {
         if (count >= maxReinf || budget <= 0) break;
-        int up = std::min(cd.maxUp, std::min(2, budget));
-        if (up > 0 && up <= myScore) { myScore -= up; budget -= up; cd.child->edgeStrength += up; count++; }
+        int afford = m_reinfCost>0 ? budget/m_reinfCost : 100;   // 预算可买级数 (免费则不限)
+        int lvlCap = (m_reinfCost > 1) ? 1 : 2;                  // 高成本规则下更克制
+        int up = std::min(cd.maxUp, std::min(lvlCap, afford));
+        int cst = up*m_reinfCost;
+        if (up > 0 && cst <= myScore) { myScore -= cst; budget -= cst; cd.child->edgeStrength += up; count++; }
     }
-    // ===== 节点攻击力增强: 预算富余时, 给最靠近敌根的可扩展节点提升攻击 =====
-    if (budget > 0 && myScore > 0 && m_sit.myNodes >= 4) {
-        Node* enRoot = nullptr;
-        for (auto* nn : nodes)
-            if (nn->parent == nullptr && !sameColor(nn->team, myTeam)) { enRoot = nn; break; }
-        Node* bestNode = nullptr;
-        float bestD = 1e18f;
-        for (auto* n : nodes) {
-            if (!sameColor(n->team, myTeam) || n->children.size() >= 2) continue;
-            if (n->attack >= m_attackMax) continue;
-            float d = enRoot ? len2(n->pos, enRoot->pos) : 1e18f;
-            if (d < bestD) { bestD = d; bestNode = n; }
-        }
-        if (bestNode) {
-            int up = std::min(m_attackMax - bestNode->attack, budget);
-            if (up > 0 && up <= myScore) { myScore -= up; budget -= up; bestNode->attack += up; }
+    // ===== 节点攻击力增强: 预算富余时, 给最靠近敌根的可扩展节点提升攻击 (成本按规则 attackCost) =====
+    // 用本地 myNodeCount (reinforce 可能在本局第一次调用, m_sit 是残留状态)
+    // 攻击是进攻投资: 升级后至少保留 max(5, 一半) 积分 (防止豪赌破产, 对局败因之一)
+    if (budget > 0 && myScore > 0 && myNodeCount >= 4) {
+        int atkBudget = std::min(budget, myScore - std::max(5, myScore/2));
+        if (atkBudget > 0) {
+            Node* enRoot = nullptr;
+            for (auto* nn : nodes)
+                if (nn->parent == nullptr && !sameColor(nn->team, myTeam)) { enRoot = nn; break; }
+            Node* bestNode = nullptr;
+            float bestD = 1e18f;
+            for (auto* n : nodes) {
+                if (!sameColor(n->team, myTeam) || n->children.size() >= 2) continue;
+                if (n->attack >= m_attackMax) continue;
+                float d = enRoot ? len2(n->pos, enRoot->pos) : 1e18f;
+                if (d < bestD) { bestD = d; bestNode = n; }
+            }
+            if (bestNode) {
+                int afford = m_attackCost>0 ? atkBudget/m_attackCost : 100;   // 免费则不限
+                int up = std::min(m_attackMax - bestNode->attack, afford);
+                int cst = up*m_attackCost;
+                if (up > 0 && cst <= myScore) { myScore -= cst; budget -= cst; bestNode->attack += up; }
+            }
         }
     }
 }
@@ -1177,7 +1248,7 @@ float AI::quickScore(Node* parent, PointF tgt, int str, int ext,
                      const std::vector<Node*>& nodes, Node* myRoot, Node* enemyRoot,
                      const std::vector<ScorePoint>& scores, const Color& myTeam) const {
     float s = 0.5f;
-    int cost = ext + (str - DEF_STR);
+    int cost = ext*m_extendCost + (str - DEF_STR)*m_reinfCost;
     PointF src = parent->pos;
     bool collected = false;
     float collectValue = 0.f;
@@ -1237,15 +1308,15 @@ AI::Move AI::bestFromNode(Node* n, const std::vector<Node*>& nodes, Node* myRoot
     for (auto& t : targets) {
         if (t.X < 25 || t.X > WIN_W - 25 || t.Y < 25 || t.Y > WIN_H - 25) continue;
         float dist = len2(n->pos, t);
-        if (dist < 20 || dist > MAX_D + 3 * EXTRA_D) continue;
+        if (dist < 20 || dist > maxReach()) continue;
         bool occ = false;
         for (auto* o : nodes)
             if (o != n && len2(o->pos, t) < OCCUPY_R) { occ = true; break; }
         if (occ) continue;
         int ext = 0;
-        if (dist > MAX_D) { ext = (int)std::ceil((dist - MAX_D) / EXTRA_D); if (ext > 3) ext = 3; }
+        if (dist > MAX_D) { ext = (int)std::ceil((dist - MAX_D) / EXTRA_D); if (ext > m_extendMax) ext = m_extendMax; }
         for (int str = DEF_STR; str <= MAX_STR; ++str) {
-            if (ext + (str - DEF_STR) > std::max(0, myScore)) break;
+            if (ext*m_extendCost + (str - DEF_STR)*m_reinfCost > std::max(0, myScore)) break;
             float s = quickScore(n, t, str, ext, nodes, myRoot, enemyRoot, scores, myTeam);
             if (s > best.score) { best.parent = n; best.target = t;
                                    best.strength = str; best.extend = ext; best.score = s; }
@@ -1260,6 +1331,7 @@ float AI::simulateLookahead(Node* parent, PointF tgt, int str, int ext,
                             int myScore, int enScore, const std::vector<ScorePoint>& scores,
                             const Color& myTeam) {
     SimState st = cloneGame(nodes, myRoot, enemyRoot, scores, myScore, enScore, myTeam);
+    st.extendCost = m_extendCost; st.reinfCost = m_reinfCost;   // 游戏规则成本
     Node* clParent = st.nodeMap[parent];
     if (!clParent || !st.myRoot || !st.enRoot) return 0.f;
     if (!simApplyMove(st, clParent, tgt, str, ext, myTeam)) return 0.f;
